@@ -2710,6 +2710,384 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /api/sandbox/replay:
+    post:
+      summary: Replay a saved contract-call scenario deterministically (#1090)
+      description: Replays inputs and environment assumptions, checks determinism against baseline, and flags ledger-dependent results.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contractId, fn]
+              properties:
+                contractId:
+                  type: string
+                  example: "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOVO55TXU64G2K6"
+                fn:
+                  type: string
+                  example: "transfer"
+                args:
+                  type: array
+                  items: {}
+                  example: ["GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", 100]
+                env:
+                  type: object
+                  properties:
+                    protocolVersion:
+                      type: integer
+                      example: 20
+                    sequence:
+                      type: integer
+                      example: 100500
+                    timestamp:
+                      type: integer
+                      example: 1718000000
+                baselineResult:
+                  type: object
+                  properties:
+                    returnValue:
+                      type: string
+                      example: "AAAAAA=="
+                    cost:
+                      type: object
+                      properties:
+                        cpuInsns:
+                          type: integer
+                          example: 12450
+                        memBytes:
+                          type: integer
+                          example: 4096
+      responses:
+        "200":
+          description: Replay result and ledger-dependence analysis
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, isDeterministic, isLedgerDependent]
+                properties:
+                  success:
+                    type: boolean
+                  isDeterministic:
+                    type: boolean
+                  isLedgerDependent:
+                    type: boolean
+                  ledgerDependencies:
+                    type: array
+                    items:
+                      type: string
+                  warning:
+                    type: string
+                    nullable: true
+                  replayResult:
+                    type: object
+        "400":
+          description: Invalid scenario input
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/sandbox/compare-protocols:
+    post:
+      summary: Compare simulation results across protocol versions (#1091)
+      description: Compares output, CPU instructions, and memory usage under supported protocol settings (20, 21, 22) with clear environment labels.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contractId, fn]
+              properties:
+                contractId:
+                  type: string
+                  example: "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOVO55TXU64G2K6"
+                fn:
+                  type: string
+                  example: "transfer"
+                args:
+                  type: array
+                  items: {}
+                protocols:
+                  type: array
+                  items:
+                    type: integer
+                  example: [20, 21, 22]
+      responses:
+        "200":
+          description: Protocol version simulation comparison
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, comparisons, deltas]
+                properties:
+                  success:
+                    type: boolean
+                  comparisons:
+                    type: array
+                    items:
+                      type: object
+                  deltas:
+                    type: array
+                    items:
+                      type: object
+                  summary:
+                    type: string
+        "400":
+          description: Invalid input or unsupported protocol
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/sandbox/collections:
+    get:
+      summary: List scenario collections (#1092)
+      description: Returns reusable named scenario collections with pagination.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: Scenario collections list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [collections, total]
+                properties:
+                  collections:
+                    type: array
+                    items:
+                      type: object
+                  total:
+                    type: integer
+    post:
+      summary: Create or update a scenario collection (#1092)
+      description: Persists a reusable named scenario collection without private keys or secrets.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  example: "Token Transfer Test Scenarios"
+                description:
+                  type: string
+                scenarios:
+                  type: array
+                  items:
+                    type: object
+      responses:
+        "201":
+          description: Collection saved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [collection]
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/sandbox/collections/{id}:
+    get:
+      summary: Retrieve a scenario collection by ID (#1092)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Scenario collection details
+        "404":
+          description: Not found
+    delete:
+      summary: Delete a scenario collection by ID (#1092)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted successfully
+
+  /api/sandbox/collections/export:
+    post:
+      summary: Export a scenario collection without private keys or secrets (#1092)
+      description: Deeply scans and sanitizes scenarios, removing Stellar secret keys (S...) and sensitive fields before exporting.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                collectionId:
+                  type: string
+                collection:
+                  type: object
+      responses:
+        "200":
+          description: Exported collection JSON envelope
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version, collection, strippedSecretsCount]
+        "400":
+          description: Bad request
+        "404":
+          description: Collection not found
+
+  /api/sandbox/collections/import:
+    post:
+      summary: Import a scenario collection (#1092)
+      description: Validates and imports a scenario collection, stripping any detected secrets.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Imported collection
+        "400":
+          description: Invalid collection format
+
+  /api/sandbox/validate-auth:
+    post:
+      summary: Validate authorization requirements before simulation (#1093)
+      description: Analyzes required authorization entries for an invocation, explaining requirements and identifying missing or malformed inputs.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contractId, fn]
+              properties:
+                contractId:
+                  type: string
+                  example: "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOVO55TXU64G2K6"
+                fn:
+                  type: string
+                  example: "transfer"
+                args:
+                  type: array
+                  items: {}
+                  example: ["GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", "GB6NVEN5HSUBKMYCE5ZOWSK5K2QDTWRGQTXKFMTLQSDNAIKTG76UZEHG", 1000]
+                auth:
+                  type: array
+                  items:
+                    type: string
+                  description: Array of base64-encoded SorobanAuthorizationEntry XDR strings
+                sourceAccount:
+                  type: string
+                  example: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+      responses:
+        "200":
+          description: Authorization validation result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [valid, requiredEntries, missing, malformed, explanation]
+                properties:
+                  valid:
+                    type: boolean
+                  contractId:
+                    type: string
+                  function:
+                    type: string
+                  requiredEntries:
+                    type: array
+                    items:
+                      type: object
+                  missing:
+                    type: array
+                    items:
+                      type: object
+                  malformed:
+                    type: array
+                    items:
+                      type: object
+                  providedEntries:
+                    type: array
+                    items:
+                      type: object
+                  explanation:
+                    type: string
+        "400":
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /api/spec/{id}:
     get:
       summary: On-chain spec for a contract (functions only, legacy)

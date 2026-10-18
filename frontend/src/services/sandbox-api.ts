@@ -1,15 +1,20 @@
-import { Account, Address, BASE_FEE, Keypair, Networks, Operation, TransactionBuilder, nativeToScVal, xdr } from "@stellar/stellar-sdk";
+import {
+  Account,
+  Address,
+  BASE_FEE,
+  Keypair,
+  Networks,
+  Operation,
+  TransactionBuilder,
+  nativeToScVal,
+  xdr,
+} from "@stellar/stellar-sdk";
 import { SandboxFile } from "./webcontainer";
 
 // ImportMetaEnv (including VITE_API_URL) is declared globally in src/env.d.ts.
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:3001";
 const DEFAULT_RPC_URL = import.meta.env.VITE_SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
-type SorobanReadMethod =
-  | "simulateTransaction"
-  | "getLedgerEntries"
-  | "getLatestLedger"
-  | "getNetwork"
-  | "getEvents";
+type SorobanReadMethod = "simulateTransaction" | "getLedgerEntries" | "getLatestLedger" | "getNetwork" | "getEvents";
 
 export async function sorobanRpcRequest<T>(
   rpcUrl: string,
@@ -165,7 +170,9 @@ interface LocalState {
 export function parseArgs(json: string): xdr.ScVal[] {
   const values = json.trim() ? JSON.parse(json) : [];
   if (!Array.isArray(values)) throw new Error("Arguments must be a JSON array");
-  return values.map((v) => (typeof v === "string" && /^[GC][A-Z2-7]{55}$/.test(v) ? new Address(v).toScVal() : nativeToScVal(v)));
+  return values.map((v) =>
+    typeof v === "string" && /^[GC][A-Z2-7]{55}$/.test(v) ? new Address(v).toScVal() : nativeToScVal(v),
+  );
 }
 
 function invokeHostFunction(contractId: string, fn: string, args: xdr.ScVal[]): xdr.HostFunction {
@@ -282,7 +289,11 @@ export class LocalSandboxHost {
       stateDiff: { key: string; before: string | null; after: string | null }[];
     }>({ op: "invoke", hostFn: invokeHostFunction(contractId, fn, args).toXDR("base64"), diagnostics: false });
     const warnings: string[] = [];
-    if (this.protocolVersion !== null && this.networkProtocol !== null && this.protocolVersion !== this.networkProtocol) {
+    if (
+      this.protocolVersion !== null &&
+      this.networkProtocol !== null &&
+      this.protocolVersion !== this.networkProtocol
+    ) {
       warnings.push(
         `Bundled host is protocol ${this.protocolVersion} but imported state is from protocol ${this.networkProtocol}; results may differ from the network.`,
       );
@@ -319,4 +330,262 @@ function mergeLocalState(update: LocalState): LocalState {
     // quota exceeded — state still lives in the worker for this session
   }
   return merged;
+}
+
+// ── Replay, Protocol Comparison, Scenario Collections, and Auth Validation (#1090-#1093) ──
+
+export interface ContractCallScenario {
+  id?: string;
+  name?: string;
+  description?: string;
+  contractId: string;
+  fn: string;
+  args: any[] | string;
+  auth?: string[];
+  env?: {
+    protocolVersion?: number;
+    sequence?: number;
+    timestamp?: number;
+    networkPassphrase?: string;
+    ledgerEntries?: any[];
+  };
+  baselineResult?: {
+    returnValue?: string;
+    error?: string;
+    cost?: { cpuInsns: number; memBytes: number };
+    events?: string[];
+  } | null;
+}
+
+export interface ReplayResult {
+  success: boolean;
+  scenarioId?: string;
+  scenarioName?: string;
+  isDeterministic: boolean;
+  isLedgerDependent: boolean;
+  ledgerDependencies: string[];
+  warning?: string | null;
+  replayResult: {
+    success: boolean;
+    returnValue?: string;
+    error?: string;
+    cost: { cpuInsns: number; memBytes: number };
+    events: string[];
+  };
+  comparison?: {
+    matched: boolean;
+    returnValueMatch: boolean;
+    errorMatch: boolean;
+    costDelta: { cpuInsns: number; memBytes: number };
+  } | null;
+  environmentAssumptions?: Record<string, any>;
+}
+
+export interface ProtocolComparisonResult {
+  success: boolean;
+  contractId: string;
+  fn: string;
+  supportedProtocols: number[];
+  comparisons: Array<{
+    protocol: number;
+    label: string;
+    environment: {
+      protocol: number;
+      network: string;
+      status: string;
+      wasmSpec?: string;
+      hostFeatures?: string[];
+    };
+    success: boolean;
+    returnValue?: string;
+    cost: { cpuInsns: number; memBytes: number };
+    minResourceFee: number;
+    events: string[];
+    error?: string;
+  }>;
+  deltas: Array<{
+    baselineProtocol: number;
+    comparedProtocol: number;
+    cpuDelta: number;
+    cpuPercentChange: number;
+    memDelta: number;
+    memPercentChange: number;
+    returnValueMatch: boolean;
+    errorMatch: boolean;
+  }>;
+  summary: string;
+}
+
+export interface ScenarioCollection {
+  id: string;
+  name: string;
+  description: string;
+  scenarios: ContractCallScenario[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AuthValidationResult {
+  valid: boolean;
+  contractId: string;
+  function: string;
+  requiredEntries: Array<{
+    signer: string;
+    scope: string;
+    reason: string;
+    status: "present" | "missing" | "malformed";
+  }>;
+  missing: Array<{
+    signer: string;
+    scope: string;
+    reason: string;
+  }>;
+  malformed: Array<{
+    index?: number;
+    field?: string;
+    entry?: any;
+    error: string;
+  }>;
+  providedEntries: Array<{
+    signer: string;
+    credentialType: string;
+    scopes: string[];
+  }>;
+  explanation: string;
+}
+
+export async function replayScenario(scenario: ContractCallScenario): Promise<ReplayResult> {
+  const res = await fetch(`${API_BASE}/api/sandbox/replay`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(scenario),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Replay failed: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function compareProtocols(
+  contractId: string,
+  fn: string,
+  args: any[] = [],
+  protocols?: number[],
+  env?: Record<string, any>,
+): Promise<ProtocolComparisonResult> {
+  const res = await fetch(`${API_BASE}/api/sandbox/compare-protocols`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contractId, fn, args, protocols, env }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Protocol comparison failed: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function listCollections(
+  limit: number = 50,
+  offset: number = 0,
+): Promise<{
+  collections: Array<{
+    id: string;
+    name: string;
+    description: string;
+    scenarioCount: number;
+    createdAt: string;
+    updatedAt: string;
+  }>;
+  total: number;
+}> {
+  const res = await fetch(`${API_BASE}/api/sandbox/collections?limit=${limit}&offset=${offset}`);
+  if (!res.ok) throw new Error(`Failed to list scenario collections: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getCollection(id: string): Promise<ScenarioCollection> {
+  const res = await fetch(`${API_BASE}/api/sandbox/collections/${id}`);
+  if (!res.ok) throw new Error(`Failed to get scenario collection: ${res.statusText}`);
+  return res.json();
+}
+
+export async function saveCollection(
+  collection: Partial<ScenarioCollection>,
+): Promise<{ collection: ScenarioCollection; strippedSecretsCount: number }> {
+  const res = await fetch(`${API_BASE}/api/sandbox/collections`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(collection),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to save scenario collection: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function deleteCollection(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/sandbox/collections/${id}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(`Failed to delete scenario collection: ${res.statusText}`);
+}
+
+export async function exportCollection(collectionIdOrData: string | Partial<ScenarioCollection>): Promise<{
+  version: number;
+  exportedAt: string;
+  schema: string;
+  collection: ScenarioCollection;
+  strippedSecretsCount: number;
+}> {
+  const payload =
+    typeof collectionIdOrData === "string" ? { collectionId: collectionIdOrData } : { collection: collectionIdOrData };
+  const res = await fetch(`${API_BASE}/api/sandbox/collections/export`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to export scenario collection: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function importCollection(data: string | Record<string, any>): Promise<{
+  success: boolean;
+  collection: ScenarioCollection;
+  strippedSecretsCount: number;
+}> {
+  const res = await fetch(`${API_BASE}/api/sandbox/collections/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: typeof data === "string" ? data : JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Failed to import scenario collection: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function validateSimulationAuth(
+  contractId: string,
+  fn: string,
+  args: any[] = [],
+  auth: string[] = [],
+  sourceAccount?: string,
+): Promise<AuthValidationResult> {
+  const res = await fetch(`${API_BASE}/api/sandbox/validate-auth`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contractId, fn, args, auth, sourceAccount }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Auth validation request failed: ${res.statusText}`);
+  }
+  return res.json();
 }

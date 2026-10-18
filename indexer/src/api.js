@@ -9,12 +9,7 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import swaggerUi from "swagger-ui-express";
 import { db as defaultDb, pool } from "./db.js";
-import {
-  getNetworkMetrics,
-  RANGES as NETWORK_METRIC_RANGES,
-  getLedgerDetail,
-  listLedgers,
-} from "./networkMetrics.js";
+import { getNetworkMetrics, RANGES as NETWORK_METRIC_RANGES, getLedgerDetail, listLedgers } from "./networkMetrics.js";
 import { safeFetch } from "./safeHttp.js";
 import config from "./config.js";
 import { InvalidCursorError, CursorFilterMismatchError } from "./cursor.js";
@@ -50,7 +45,13 @@ export function handleCursorError(e, res) {
 import { analyzeSourceDependencies } from "./dependencyScanner.js";
 import { fetchTokenMetadata } from "./sep41Metadata.js";
 import { fetchWalletBalances, fetchAccountMeta, AccountNotFoundError } from "./horizonBalances.js";
-import { attachWebSocketServer, attachEventStreamRoutes, getTransactionStatus, onTransactionStatus, offTransactionStatus } from "./wsEvents.js";
+import {
+  attachWebSocketServer,
+  attachEventStreamRoutes,
+  getTransactionStatus,
+  onTransactionStatus,
+  offTransactionStatus,
+} from "./wsEvents.js";
 import { verifyAbi } from "./verify_abi.js";
 import { getMetrics } from "./rpcMetrics.js";
 import { getRpcNodeStatus, getProviderStats, multiNodeRpc } from "./rpcMultiNode.js";
@@ -97,7 +98,13 @@ import {
 } from "./cacheLayer.js";
 import { recordAccess, schedulePrefetch } from "./prefetchEngine.js";
 import { attachGraphQL } from "./graphql.js";
-import { attachCollabServer, createSession as createCollabSession, authorize as authorizeCollab, rotateToken as rotateCollabToken, kickParticipants as kickCollabParticipants } from "./collab/server.js";
+import {
+  attachCollabServer,
+  createSession as createCollabSession,
+  authorize as authorizeCollab,
+  rotateToken as rotateCollabToken,
+  kickParticipants as kickCollabParticipants,
+} from "./collab/server.js";
 import { requestContext } from "./logger.js";
 import { runAllChecks } from "./doctor-lib.js";
 import { registry } from "./metrics.js";
@@ -112,9 +119,24 @@ import {
   takeChallenge,
   isElevated,
 } from "./auth/session.js";
-import { registrationOptions, verifyRegistration, authenticationOptions, verifyAuthentication } from "./auth/passkeys.js";
-import { EMAIL_PURPOSES, sendEmailLink, consumeEmailLink, issueRecoveryCodes, hashRecoveryCode } from "./auth/recovery.js";
-import { sep10Enabled, buildChallenge as buildSep10Challenge, verifyChallenge as verifySep10Challenge } from "./auth/sep10.js";
+import {
+  registrationOptions,
+  verifyRegistration,
+  authenticationOptions,
+  verifyAuthentication,
+} from "./auth/passkeys.js";
+import {
+  EMAIL_PURPOSES,
+  sendEmailLink,
+  consumeEmailLink,
+  issueRecoveryCodes,
+  hashRecoveryCode,
+} from "./auth/recovery.js";
+import {
+  sep10Enabled,
+  buildChallenge as buildSep10Challenge,
+  verifyChallenge as verifySep10Challenge,
+} from "./auth/sep10.js";
 import { createKey } from "./admin/keyManager.js";
 import { evaluateSubmission, reportContract, fileAppeal, HIDDEN_STATUSES } from "./moderation/service.js";
 import pg from "pg";
@@ -322,16 +344,10 @@ function validateAlertRule(input) {
     ) {
       return { valid: false, error: "decoded_predicate requires a supported field, operator, and scalar value" };
     }
-    if (
-      ["function", "description"].includes(config.field) &&
-      !["eq", "neq"].includes(config.operator)
-    ) {
+    if (["function", "description"].includes(config.field) && !["eq", "neq"].includes(config.operator)) {
       return { valid: false, error: "string predicates support only eq and neq" };
     }
-    if (
-      !["function", "description"].includes(config.field) &&
-      !Number.isFinite(Number(config.value))
-    ) {
+    if (!["function", "description"].includes(config.field) && !Number.isFinite(Number(config.value))) {
       return { valid: false, error: "numeric predicates require a numeric value" };
     }
     if (!["function", "description"].includes(config.field)) {
@@ -387,13 +403,21 @@ async function dryRunAlertRule(db, rule) {
   const now = Date.now();
   const end = Math.floor((now - ALERT_EVENT_TIME_GRACE_MS) / durationMs) * durationMs;
   const start = Math.floor((now - 86_400_000) / durationMs) * durationMs;
-  const baselineWindows = rule.rule_type === "anomaly"
-    ? Math.min(168, Math.max(3, Number(rule.config.baseline_windows) || 24))
-    : rule.rule_type === "rate_of_change"
-      ? 1
-      : 0;
+  const baselineWindows =
+    rule.rule_type === "anomaly"
+      ? Math.min(168, Math.max(3, Number(rule.config.baseline_windows) || 24))
+      : rule.rule_type === "rate_of_change"
+        ? 1
+        : 0;
   const queryStart = new Date(start - baselineWindows * durationMs);
-  const params = [getIndexerNetwork(), rule.contract_id, rule.window_seconds, new Date(start), queryStart, new Date(end)];
+  const params = [
+    getIndexerNetwork(),
+    rule.contract_id,
+    rule.window_seconds,
+    new Date(start),
+    queryStart,
+    new Date(end),
+  ];
   let predicate = "";
   if (rule.rule_type === "function_match") {
     params.push(rule.config.function);
@@ -473,8 +497,7 @@ async function dryRunAlertRule(db, rule) {
       (rule.mute_windows ?? []).some(
         (mute) => new Date(mute.start).getTime() <= windowEnd && new Date(mute.end).getTime() > windowEnd,
       );
-    const cooldownElapsed =
-      !lastFiredAt || windowEnd - lastFiredAt >= Number(rule.cooldown_seconds) * 1000;
+    const cooldownElapsed = !lastFiredAt || windowEnd - lastFiredAt >= Number(rule.cooldown_seconds) * 1000;
     const wouldFire = result.matched && !muted && (!active || (rule.cooldown_seconds > 0 && cooldownElapsed));
     if (wouldFire) {
       windows.push({
@@ -692,9 +715,12 @@ export function createApi({ logDestination, dbOverride } = {}) {
   // authenticated reads of public data share edge entries; usage for edge
   // hits is counted from CDN logs (docs/guides/cdn.md).
   app.use("/api", (req, res, next) => {
-    const policy = edgeCachePolicy({ method: req.method, path: req.originalUrl.split("?")[0] }, {
-      purgeHealthy: isPurgeHealthy(),
-    });
+    const policy = edgeCachePolicy(
+      { method: req.method, path: req.originalUrl.split("?")[0] },
+      {
+        purgeHealthy: isPurgeHealthy(),
+      },
+    );
     res.set("Surrogate-Control", policy.edge);
     res.set("CDN-Cache-Control", policy.edge);
     if (policy.keys.length) {
@@ -1018,10 +1044,11 @@ export function createApi({ logDestination, dbOverride } = {}) {
 
   alertsRouter.get("/:id/history", async (req, res) => {
     try {
-      const rule = await db.query(
-        "SELECT id FROM alert_rules WHERE id = $1 AND api_key_id = $2 AND network = $3",
-        [req.params.id, req.rateContext.keyId, getIndexerNetwork()],
-      );
+      const rule = await db.query("SELECT id FROM alert_rules WHERE id = $1 AND api_key_id = $2 AND network = $3", [
+        req.params.id,
+        req.rateContext.keyId,
+        getIndexerNetwork(),
+      ]);
       if (!rule.rows[0]) return res.status(404).json({ error: "alert rule not found" });
       const { rows } = await db.query(
         `SELECT id, window_start, window_end, status, event_count, details, evaluated_at
@@ -1037,10 +1064,11 @@ export function createApi({ logDestination, dbOverride } = {}) {
 
   alertsRouter.post("/:id/dry-run", async (req, res) => {
     try {
-      const { rows } = await db.query(
-        "SELECT * FROM alert_rules WHERE id = $1 AND api_key_id = $2 AND network = $3",
-        [req.params.id, req.rateContext.keyId, getIndexerNetwork()],
-      );
+      const { rows } = await db.query("SELECT * FROM alert_rules WHERE id = $1 AND api_key_id = $2 AND network = $3", [
+        req.params.id,
+        req.rateContext.keyId,
+        getIndexerNetwork(),
+      ]);
       if (!rows[0]) return res.status(404).json({ error: "alert rule not found" });
       const result = await dryRunAlertRule(db, rows[0]);
       res.json(result);
@@ -1080,7 +1108,9 @@ export function createApi({ logDestination, dbOverride } = {}) {
   // Email link for signup (first passkey), claim (existing API keys) or recovery.
   app.post("/api/auth/email/start", authLimiter, async (req, res) => {
     try {
-      const email = String(req.body?.email ?? "").trim().toLowerCase();
+      const email = String(req.body?.email ?? "")
+        .trim()
+        .toLowerCase();
       const purpose = String(req.body?.purpose ?? "signup");
       if (!EMAIL_RE.test(email) || !EMAIL_PURPOSES.includes(purpose)) {
         return res.status(400).json({ error: "valid email and purpose are required" });
@@ -1196,7 +1226,11 @@ export function createApi({ logDestination, dbOverride } = {}) {
   app.post("/api/auth/step-up/options", requireSession, async (req, res) => {
     try {
       const options = await authenticationOptions(req.session.account_id);
-      await issueChallenge(res, { purpose: "step_up", challenge: options.challenge, accountId: req.session.account_id });
+      await issueChallenge(res, {
+        purpose: "step_up",
+        challenge: options.challenge,
+        accountId: req.session.account_id,
+      });
       res.json(options);
     } catch (e) {
       authError(res, e);
@@ -1222,7 +1256,11 @@ export function createApi({ logDestination, dbOverride } = {}) {
     try {
       res.json({
         account: await accountView(req.session.account_id),
-        session: { auth_method: req.session.auth_method, elevated: isElevated(req.session), expires_at: req.session.expires_at },
+        session: {
+          auth_method: req.session.auth_method,
+          elevated: isElevated(req.session),
+          expires_at: req.session.expires_at,
+        },
         api_keys: await db.listAccountApiKeys(req.session.account_id),
       });
     } catch (e) {
@@ -1283,7 +1321,11 @@ export function createApi({ logDestination, dbOverride } = {}) {
       const account = String(req.query.account ?? "");
       if (!/^G[A-Z2-7]{55}$/.test(account)) return res.status(400).json({ error: "account must be a G... address" });
       const transaction = buildSep10Challenge(account);
-      await issueChallenge(res, { purpose: "stellar", challenge: transaction, accountId: req.session?.account_id ?? null });
+      await issueChallenge(res, {
+        purpose: "stellar",
+        challenge: transaction,
+        accountId: req.session?.account_id ?? null,
+      });
       res.json({ transaction });
     } catch (e) {
       authError(res, e);
@@ -1296,7 +1338,8 @@ export function createApi({ logDestination, dbOverride } = {}) {
       if (!challenge) return res.status(400).json({ error: "Challenge expired" });
       const address = verifySep10Challenge(String(req.body?.transaction ?? ""), challenge.challenge);
       if (req.session) {
-        if (!isElevated(req.session)) return res.status(403).json({ error: "Re-authentication required", step_up: true });
+        if (!isElevated(req.session))
+          return res.status(403).json({ error: "Re-authentication required", step_up: true });
         await db.linkStellarAddress(req.session.account_id, address);
         return res.json({ linked: address });
       }
@@ -1426,15 +1469,17 @@ export function createApi({ logDestination, dbOverride } = {}) {
 
   // RFC 9116 security contact (#932) — mirrors frontend/public/.well-known/security.txt.
   app.get("/.well-known/security.txt", (_req, res) => {
-    res.type("text/plain").send(
-      [
-        "Contact: https://github.com/Soroban-Smart-Block-Explorer/Soroban-Smart-Block/security/advisories/new",
-        "Expires: 2027-09-26T00:00:00.000Z",
-        "Policy: https://github.com/Soroban-Smart-Block-Explorer/Soroban-Smart-Block/blob/main/SECURITY.md",
-        "Preferred-Languages: en",
-        "",
-      ].join("\n"),
-    );
+    res
+      .type("text/plain")
+      .send(
+        [
+          "Contact: https://github.com/Soroban-Smart-Block-Explorer/Soroban-Smart-Block/security/advisories/new",
+          "Expires: 2027-09-26T00:00:00.000Z",
+          "Policy: https://github.com/Soroban-Smart-Block-Explorer/Soroban-Smart-Block/blob/main/SECURITY.md",
+          "Preferred-Languages: en",
+          "",
+        ].join("\n"),
+      );
   });
 
   app.get("/health", healthHandler);
@@ -1624,7 +1669,7 @@ export function createApi({ logDestination, dbOverride } = {}) {
       const filters = parseRpcFilters(input);
       const { sql, params } = compileRpcFilters(filters);
       const limits = FILTER_TIER_LIMITS[req.rateContext?.tier] ?? FILTER_TIER_LIMITS.unauthenticated;
-      const source = req.method === "POST" ? req.body ?? {} : req.query;
+      const source = req.method === "POST" ? (req.body ?? {}) : req.query;
       const limit = Math.min(Number(source.limit) || 25, 200);
       const afterSeq = Number(source.after_seq) || 0;
       const result = await db.queryEventsByFilter({ where: sql, params, afterSeq, limit, ...limits });
@@ -1827,7 +1872,7 @@ export function createApi({ logDestination, dbOverride } = {}) {
       const { rows } = await pool.query(
         `SELECT *, CASE WHEN contract_id IS NULL OR contract_id = '' THEN 'classic' ELSE 'soroban' END AS type
          FROM events ${finalWhere} ORDER BY seq DESC LIMIT $${sqlParams.length}`,
-        sqlParams
+        sqlParams,
       );
 
       const data = rows.slice(0, limitValue);
@@ -1849,12 +1894,17 @@ export function createApi({ logDestination, dbOverride } = {}) {
       const transaction = await db.getTransaction(req.params.hash);
       if (!transaction) return res.status(404).json({ error: "Transaction not found" });
       res.json(transaction);
-    } catch (error) { res.status(500).json({ error: error.message }); }
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
   });
 
   app.get("/api/accounts/:id/transactions", async (req, res) => {
-    try { res.json(await db.getAccountTransactions(req.params.id, req.query.limit)); }
-    catch (error) { res.status(500).json({ error: error.message }); }
+    try {
+      res.json(await db.getAccountTransactions(req.params.id, req.query.limit));
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
   });
 
   app.get("/api/transactions/status", async (req, res) => {
@@ -2125,7 +2175,15 @@ export function createApi({ logDestination, dbOverride } = {}) {
       const { function: fn, args = {} } = req.body;
       if (!fn) return res.status(400).json({ error: "Missing function name" });
 
-      const { rpc: SorobanRpc, Contract, nativeToScVal, TransactionBuilder, Networks, BASE_FEE, Account } = await import("@stellar/stellar-sdk");
+      const {
+        rpc: SorobanRpc,
+        Contract,
+        nativeToScVal,
+        TransactionBuilder,
+        Networks,
+        BASE_FEE,
+        Account,
+      } = await import("@stellar/stellar-sdk");
       const rpcUrl = process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
       const networkPassphrase = process.env.NETWORK_PASSPHRASE || Networks.TESTNET;
       const server = new SorobanRpc.Server(rpcUrl, { allowHttp: true });
@@ -2571,7 +2629,11 @@ export function createApi({ logDestination, dbOverride } = {}) {
       res.json({
         entries: found.entries.map((e) => ({
           key: e.key.toXDR("base64"),
-          entry: new xdr.LedgerEntry({ lastModifiedLedgerSeq: e.lastModifiedLedgerSeq ?? 0, data: e.val, ext: new xdr.LedgerEntryExt(0) }).toXDR("base64"),
+          entry: new xdr.LedgerEntry({
+            lastModifiedLedgerSeq: e.lastModifiedLedgerSeq ?? 0,
+            data: e.val,
+            ext: new xdr.LedgerEntryExt(0),
+          }).toXDR("base64"),
           liveUntilLedgerSeq: e.liveUntilLedgerSeq ?? null,
         })),
         latestLedger: latest.sequence,
@@ -2622,6 +2684,141 @@ export function createApi({ logDestination, dbOverride } = {}) {
     }
   });
 
+  // POST /api/sandbox/replay — deterministic replay for saved contract-call scenarios (#1090)
+  app.post("/api/sandbox/replay", writeLimiter, requireApiKey, async (req, res) => {
+    try {
+      if (!req.body || typeof req.body !== "object" || Object.keys(req.body).length === 0) {
+        return res.status(400).json({ error: "Missing scenario payload" });
+      }
+      const { replayScenario } = await import("./sandboxReplay.js");
+      const result = await replayScenario(req.body);
+      res.json(result);
+    } catch (e) {
+      const status =
+        e.message.includes("required") || e.message.includes("must be") || e.message.includes("Invalid") ? 400 : 500;
+      res.status(status).json({ error: e.message });
+    }
+  });
+
+  // POST /api/sandbox/compare-protocols — compare simulation results across protocol versions (#1091)
+  app.post("/api/sandbox/compare-protocols", writeLimiter, requireApiKey, async (req, res) => {
+    try {
+      if (!req.body || typeof req.body !== "object" || Object.keys(req.body).length === 0) {
+        return res.status(400).json({ error: "Missing request body" });
+      }
+      const { compareProtocolSimulations } = await import("./sandboxProtocols.js");
+      const result = await compareProtocolSimulations(req.body);
+      res.json(result);
+    } catch (e) {
+      const status =
+        e.message.includes("required") ||
+        e.message.includes("must be") ||
+        e.message.includes("Unsupported") ||
+        e.message.includes("empty")
+          ? 400
+          : 500;
+      res.status(status).json({ error: e.message });
+    }
+  });
+
+  // GET /api/sandbox/collections — list reusable scenario collections (#1092)
+  app.get("/api/sandbox/collections", requireApiKey, async (req, res) => {
+    try {
+      const limit = parseInt(req.query.limit || "50", 10);
+      const offset = parseInt(req.query.offset || "0", 10);
+      const { listCollections } = await import("./sandboxCollections.js");
+      res.json(await listCollections({ limit, offset }));
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // POST /api/sandbox/collections — save/create named scenario collection (#1092)
+  app.post("/api/sandbox/collections", writeLimiter, requireApiKey, async (req, res) => {
+    try {
+      if (!req.body || typeof req.body !== "object" || Object.keys(req.body).length === 0) {
+        return res.status(400).json({ error: "Missing collection payload" });
+      }
+      const { saveCollection } = await import("./sandboxCollections.js");
+      const result = await saveCollection(req.body);
+      res.status(201).json(result);
+    } catch (e) {
+      const status =
+        e.message.includes("required") || e.message.includes("must be") || e.message.includes("Invalid") ? 400 : 500;
+      res.status(status).json({ error: e.message });
+    }
+  });
+
+  // GET /api/sandbox/collections/:id — retrieve named scenario collection (#1092)
+  app.get("/api/sandbox/collections/:id", requireApiKey, async (req, res) => {
+    try {
+      const { getCollection } = await import("./sandboxCollections.js");
+      const collection = await getCollection(req.params.id);
+      if (!collection) {
+        return res.status(404).json({ error: `Scenario collection not found: ${req.params.id}` });
+      }
+      res.json(collection);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // DELETE /api/sandbox/collections/:id — delete scenario collection (#1092)
+  app.delete("/api/sandbox/collections/:id", writeLimiter, requireApiKey, async (req, res) => {
+    try {
+      const { deleteCollection } = await import("./sandboxCollections.js");
+      const result = await deleteCollection(req.params.id);
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // POST /api/sandbox/collections/export — export collection without private keys or secrets (#1092)
+  app.post("/api/sandbox/collections/export", writeLimiter, requireApiKey, async (req, res) => {
+    try {
+      const target = req.body?.collectionId || req.body?.collection || req.body;
+      if (!target || (typeof target === "object" && Object.keys(target).length === 0)) {
+        return res.status(400).json({ error: "Missing collection or collectionId for export" });
+      }
+      const { exportCollection } = await import("./sandboxCollections.js");
+      const exported = await exportCollection(target);
+      res.json(exported);
+    } catch (e) {
+      const status = e.message.includes("not found") ? 404 : 400;
+      res.status(status).json({ error: e.message });
+    }
+  });
+
+  // POST /api/sandbox/collections/import — import collection without private keys or secrets (#1092)
+  app.post("/api/sandbox/collections/import", writeLimiter, requireApiKey, async (req, res) => {
+    try {
+      if (!req.body || (typeof req.body === "object" && Object.keys(req.body).length === 0)) {
+        return res.status(400).json({ error: "Missing import data" });
+      }
+      const { importCollection } = await import("./sandboxCollections.js");
+      const imported = await importCollection(req.body);
+      res.status(201).json(imported);
+    } catch (e) {
+      res.status(400).json({ error: e.message });
+    }
+  });
+
+  // POST /api/sandbox/validate-auth — validate auth requirements before simulation (#1093)
+  app.post("/api/sandbox/validate-auth", writeLimiter, requireApiKey, async (req, res) => {
+    try {
+      if (!req.body || typeof req.body !== "object" || Object.keys(req.body).length === 0) {
+        return res.status(400).json({ error: "Missing request body" });
+      }
+      const { validateAuthRequirements } = await import("./sandboxAuthValidator.js");
+      const result = validateAuthRequirements(req.body);
+      res.json(result);
+    } catch (e) {
+      const status = e.message.includes("required") || e.message.includes("must be") ? 400 : 500;
+      res.status(status).json({ error: e.message });
+    }
+  });
+
   // GET /api/wallet/:address — events involving a Stellar/Soroban wallet.
   // Returns 200 with { events: [...], horizon_account } (empty array for an
   // unknown address) and 400 when the address is not a well-formed Stellar
@@ -2634,7 +2831,11 @@ export function createApi({ logDestination, dbOverride } = {}) {
   // cacheInvalidate("wallet:events:*") on new events.
   app.get(
     "/api/wallet/:address",
-    makeCache("wallet", (req) => `wallet:events:${req.params.address}:${req.query.after_seq || 0}:${req.query.limit || 25}:${req.query.fn || ""}:${req.query.from || ""}:${req.query.to || ""}`),
+    makeCache(
+      "wallet",
+      (req) =>
+        `wallet:events:${req.params.address}:${req.query.after_seq || 0}:${req.query.limit || 25}:${req.query.fn || ""}:${req.query.from || ""}:${req.query.to || ""}`,
+    ),
     async (req, res) => {
       try {
         const address = req.params.address;
@@ -3381,8 +3582,11 @@ export function createApi({ logDestination, dbOverride } = {}) {
   app.get("/api/network/metrics", async (req, res) => {
     const range = req.query.range || "1h";
     if (!NETWORK_METRIC_RANGES[range]) return res.status(400).json({ error: "range must be 1h, 24h or 7d" });
-    try { res.json(await getNetworkMetrics(pool, range)); }
-    catch (e) { res.status(500).json({ error: e.message }); }
+    try {
+      res.json(await getNetworkMetrics(pool, range));
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   // GET /api/ledgers?cursor=&limit= — newest-first ledger listing (#912).
@@ -3392,8 +3596,11 @@ export function createApi({ logDestination, dbOverride } = {}) {
     if (cursor !== null && (!Number.isInteger(cursor) || cursor < 0)) {
       return res.status(400).json({ error: "cursor must be a ledger sequence" });
     }
-    try { res.json(await listLedgers(pool, { cursor, limit })); }
-    catch (e) { res.status(500).json({ error: e.message }); }
+    try {
+      res.json(await listLedgers(pool, { cursor, limit }));
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   // GET /api/ledgers/:seq — ledger header, fees, utilization, Soroban txs (#912).
@@ -3406,7 +3613,9 @@ export function createApi({ logDestination, dbOverride } = {}) {
       const detail = await getLedgerDetail(pool, seq);
       if (detail.status === "future") return res.status(404).json({ error: "ledger_not_found", ledger: seq });
       res.json(detail);
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   // GET /api/network/metrics/stream — server-sent latest ledger metrics at ledger cadence.
@@ -3422,7 +3631,9 @@ export function createApi({ logDestination, dbOverride } = {}) {
           last = latest.ledger;
           res.write(`data: ${JSON.stringify({ metric: latest, recommended, staleness_seconds })}\n\n`);
         }
-      } catch { /* keep the stream open; the client shows staleness */ }
+      } catch {
+        /* keep the stream open; the client shows staleness */
+      }
     };
     tick();
     const timer = setInterval(tick, 5000);
@@ -3447,14 +3658,21 @@ export function createApi({ logDestination, dbOverride } = {}) {
   // Point-in-time contract storage and per-key temporal history.
   app.get("/api/contracts/:id/state", async (req, res) => {
     const ledger = Number(req.query.ledger);
-    if (!Number.isInteger(ledger) || ledger < 0) return res.status(400).json({ error: "ledger must be a non-negative integer" });
-    try { res.json(await db.getContractStateAt(req.params.id, ledger, req.query.prefix || null)); }
-    catch (e) { res.status(500).json({ error: e.message }); }
+    if (!Number.isInteger(ledger) || ledger < 0)
+      return res.status(400).json({ error: "ledger must be a non-negative integer" });
+    try {
+      res.json(await db.getContractStateAt(req.params.id, ledger, req.query.prefix || null));
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   app.get("/api/contracts/:id/state/:key/history", async (req, res) => {
-    try { res.json(await db.getContractStateHistory(req.params.id, req.params.key)); }
-    catch (e) { res.status(500).json({ error: e.message }); }
+    try {
+      res.json(await db.getContractStateHistory(req.params.id, req.params.key));
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   // ── Contract Stats ────────────────────────────────────────────
@@ -3784,7 +4002,10 @@ export function createApi({ logDestination, dbOverride } = {}) {
         format: req.body.format ?? "ndjson",
         idempotencyKey: req.get("Idempotency-Key") || undefined,
       });
-      res.status(created ? 202 : 200).location(`/api/jobs/${job.id}`).json(jobView(job));
+      res
+        .status(created ? 202 : 200)
+        .location(`/api/jobs/${job.id}`)
+        .json(jobView(job));
     } catch (e) {
       res.status(e.status ?? 500).json({ error: e.message });
     }
@@ -3842,7 +4063,10 @@ export function createApi({ logDestination, dbOverride } = {}) {
       const data = hasMore ? rows.slice(0, limit) : rows;
       if (hasMore) {
         const last = data.at(-1);
-        res.setHeader("X-Next-Cursor", Buffer.from(JSON.stringify({ created_at: last.created_at, id: last.id })).toString("base64url"));
+        res.setHeader(
+          "X-Next-Cursor",
+          Buffer.from(JSON.stringify({ created_at: last.created_at, id: last.id })).toString("base64url"),
+        );
       }
       if (format === "json") {
         res.setHeader("Content-Disposition", 'attachment; filename="contracts.json"');

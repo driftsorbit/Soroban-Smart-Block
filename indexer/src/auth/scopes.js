@@ -25,7 +25,14 @@ export const SCOPES = [
 export const DEFAULT_SCOPES = ["read:events", "read:contracts"];
 
 /** Scopes given to keys that existed before scopes (their previous access). */
-export const LEGACY_SCOPES = ["read:events", "read:contracts", "write:contracts", "write:webhooks", "read:usage", "write:keys"];
+export const LEGACY_SCOPES = [
+  "read:events",
+  "read:contracts",
+  "write:contracts",
+  "write:webhooks",
+  "read:usage",
+  "write:keys",
+];
 
 const PUBLIC = [];
 const R_EVENTS = ["read:events"];
@@ -122,6 +129,12 @@ export const ROUTE_SCOPES = {
   "POST /api/simulate": R_CONTRACTS,
   "POST /api/sandbox/simulate": R_CONTRACTS,
   "POST /api/sandbox/ledger-entries": R_CONTRACTS,
+  "POST /api/sandbox/replay": R_CONTRACTS,
+  "POST /api/sandbox/compare-protocols": R_CONTRACTS,
+  "GET /api/sandbox/collections": R_CONTRACTS,
+  "GET /api/sandbox/collections/:id": R_CONTRACTS,
+  "POST /api/sandbox/collections/export": R_CONTRACTS,
+  "POST /api/sandbox/validate-auth": R_CONTRACTS,
   "POST /api/auth-tree": R_CONTRACTS,
   "POST /api/batch": R_CONTRACTS,
   "POST /api/batch/estimate-gas": R_CONTRACTS,
@@ -136,6 +149,9 @@ export const ROUTE_SCOPES = {
   "POST /api/verify": W_CONTRACTS,
   "POST /api/sandbox": W_CONTRACTS,
   "DELETE /api/sandbox/:id": W_CONTRACTS,
+  "POST /api/sandbox/collections": W_CONTRACTS,
+  "DELETE /api/sandbox/collections/:id": W_CONTRACTS,
+  "POST /api/sandbox/collections/import": W_CONTRACTS,
   "POST /api/collab/sessions": W_CONTRACTS,
   // Authorised by the session owner token (x-collab-token), not an API key.
   "POST /api/collab/sessions/:id/rotate": PUBLIC,
@@ -191,7 +207,14 @@ const compiled = Object.entries(ROUTE_SCOPES).map(([route, scopes]) => {
   const re = new RegExp(
     `^${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/:(\w+)/g, (_, n) => (names.push(n), "([^/]+)"))}/?$`,
   );
-  return { route, method, re, names, scopes, literalSegments: path.split("/").filter((s) => s && !s.startsWith(":")).length };
+  return {
+    route,
+    method,
+    re,
+    names,
+    scopes,
+    literalSegments: path.split("/").filter((s) => s && !s.startsWith(":")).length,
+  };
 });
 // Prefer the most specific route (most literal segments) when several match.
 compiled.sort((a, b) => b.literalSegments - a.literalSegments);
@@ -201,7 +224,8 @@ export function matchRoute(method, path) {
   for (const r of compiled) {
     if (r.method !== method) continue;
     const m = path.match(r.re);
-    if (m) return { route: r.route, scopes: r.scopes, params: Object.fromEntries(r.names.map((n, i) => [n, m[i + 1]])) };
+    if (m)
+      return { route: r.route, scopes: r.scopes, params: Object.fromEntries(r.names.map((n, i) => [n, m[i + 1]])) };
   }
   return null;
 }
@@ -259,9 +283,15 @@ export function scopeMiddleware(req, res, next) {
       });
     }
     if (!contractId && CONTRACT_SCOPED_LISTS.has(match.route)) {
-      return problem(res, 403, "Insufficient scope", "This API key is restricted to specific contracts; pass ?contract=.", {
-        missing_scope: "contract:*",
-      });
+      return problem(
+        res,
+        403,
+        "Insufficient scope",
+        "This API key is restricted to specific contracts; pass ?contract=.",
+        {
+          missing_scope: "contract:*",
+        },
+      );
     }
   }
   next();
