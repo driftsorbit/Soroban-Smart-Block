@@ -203,6 +203,8 @@ import { verifySourceVerification } from "./sourceVerification.js";
 import { sendVerificationEmail, isConfigured } from "./emailService.js";
 import { getHealthStatus, getLivenessStatus, getReadinessStatus } from "./health.js";
 import * as alertManager from "./alertManager.js";
+import { collectPartialDataWarnings, hasIncompleteMetadata } from "./partialData.js";
+import { parseFieldSelection, projectEvents } from "./fieldSelection.js";
 
 const { getActiveAlerts } = alertManager;
 import { randomUUID, createHash } from "crypto";
@@ -1801,6 +1803,19 @@ export function createApi({ logDestination, dbOverride } = {}) {
           return res.status(422).json({ error: `Invalid ${key}` });
         }
       }
+      // Field selection (#1078): validate before the cache middleware so an
+      // invalid selection is never served a cached 200.
+      if (req.query.fields !== undefined) {
+        const selection = parseFieldSelection(String(req.query.fields));
+        if (!selection.ok) {
+          return res.status(422).json({
+            error: selection.error,
+            message: selection.message,
+            allowed: selection.allowed,
+          });
+        }
+        req.eventFields = selection.fields;
+      }
       next();
     },
     // Filter DSL (#902): ?filter=<text or JSON AST> or ?query_id=<saved query>.
@@ -1811,10 +1826,13 @@ export function createApi({ logDestination, dbOverride } = {}) {
       await runFilteredEvents(req, res);
     },
     makeCache("events_list", (req) => {
-      const { contract = "", fn = "", type = "", cursor = "", after = "", before = "", count = "" } = req.query;
+      const { contract = "", fn = "", type = "", cursor = "", after = "", before = "", count = "", fields = "" } = req.query;
       const afterSeq = Number(req.query.after_seq) || 0;
       const limit = Number(req.query.limit) || 25;
-      return `events:list:${contract}:${fn}:${cursor}:${after}:${before}:${afterSeq}:${limit}:${type}:${count}`;
+      // `fields` participates in the key so a projected page is never served
+      // for a full-field request (or vice versa).
+      const normalizedFields = req.eventFields ? [...req.eventFields].sort().join(",") : fields;
+      return `events:list:${contract}:${fn}:${cursor}:${after}:${before}:${afterSeq}:${limit}:${type}:${count}:${normalizedFields}`;
     }),
     async (req, res) => {
       try {
@@ -1840,15 +1858,29 @@ export function createApi({ logDestination, dbOverride } = {}) {
           count,
         });
 
-        // Predictive pre-fetch: next page if user is paginating
+        const warnings = collectPartialDataWarnings({
+          metadataIncomplete: hasIncompleteMetadata(result.data),
+        });
+
+        // Predictive pre-fetch: next page if user is paginating.
+        // The prefetched key must match makeCache()'s format exactly (including
+        // the field-selection segment) or the warmed entry is never read.
         if (result.next_cursor !== null) {
-          const key = `events:list:${contract ?? ""}:${fn ?? ""}:${cursor ?? ""}:${after ?? ""}:${before ?? ""}:${after_seq}:${limit}:${type ?? ""}:${count ?? ""}`;
+          const selected = req.eventFields ? [...req.eventFields].sort().join(",") : "";
+          const key = `events:list:${contract ?? ""}:${fn ?? ""}:${cursor ?? ""}:${after ?? ""}:${before ?? ""}:${after_seq}:${limit}:${type ?? ""}:${count ?? ""}:${selected}`;
           schedulePrefetch(key, {
-            [`events:list:${contract ?? ""}:${fn ?? ""}:${result.next_cursor}::::0:${limit}:${type ?? ""}:${count ?? ""}`]:
+            [`events:list:${contract ?? ""}:${fn ?? ""}:${result.next_cursor}::::0:${limit}:${type ?? ""}:${count ?? ""}:${selected}`]:
               () => db.getEventsCursor({ contract, fn, type, after: result.next_cursor, limit, count }),
           });
         }
-        res.json(result);
+
+        // Field selection is presentational: applied after the page is built,
+        // so it changes neither which events match nor the cursors.
+        res.json({
+          ...result,
+          data: req.eventFields ? projectEvents(result.data, req.eventFields) : result.data,
+          warnings,
+        });
       } catch (e) {
         if (handleCursorError(e, res)) return;
         res.status(500).json({ error: e.message });
@@ -3887,7 +3919,7 @@ export function createApi({ logDestination, dbOverride } = {}) {
   });
 
   // ── cursor-based pagination endpoint ────────────────────────────
-  // GET /api/v1/events?contract=&fn=&type=&cursor=&after=&before=&limit=&count=
+  // GET /api/v1/events?contract=&fn=&type=&cursor=&after=&before=&limit=&count=&fields=
   app.get("/api/v1/events", async (req, res) => {
     try {
       if (handleLegacyOffset(req, res)) return;
@@ -3897,6 +3929,20 @@ export function createApi({ logDestination, dbOverride } = {}) {
         if (isNaN(parsedLimit) || parsedLimit <= 0 || parsedLimit > 200) {
           return res.status(422).json({ error: "Invalid limit" });
         }
+      }
+
+      // Field selection (#1078) — same allowlist and bounds as /api/events.
+      let fields;
+      if (req.query.fields !== undefined) {
+        const selection = parseFieldSelection(String(req.query.fields));
+        if (!selection.ok) {
+          return res.status(422).json({
+            error: selection.error,
+            message: selection.message,
+            allowed: selection.allowed,
+          });
+        }
+        fields = selection.fields;
       }
 
       const result = await db.getEventsCursor({
@@ -3910,7 +3956,16 @@ export function createApi({ logDestination, dbOverride } = {}) {
         limit: req.query.limit ? Number(req.query.limit) : 25,
         count: req.query.count || undefined,
       });
-      res.json(result);
+
+      const warnings = collectPartialDataWarnings({
+        metadataIncomplete: hasIncompleteMetadata(result.data),
+      });
+
+      res.json({
+        ...result,
+        data: fields ? projectEvents(result.data, fields) : result.data,
+        warnings,
+      });
     } catch (e) {
       if (handleCursorError(e, res)) return;
       res.status(500).json({ error: e.message });

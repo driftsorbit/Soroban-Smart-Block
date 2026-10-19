@@ -52,13 +52,26 @@ export interface ResponseMetadata {
   rateLimitTier?: string;
 }
 
-export interface ApiResponse<T> {
-  data: T;
-  meta: ResponseMetadata;
+/**
+ * Combine a caller-supplied signal with the client timeout so cancellation
+ * does not silently disable the timeout (and vice versa).
+ */
+function withTimeout(userSignal: AbortSignal | null | undefined, ms: number): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(ms);
+  if (!userSignal) return timeoutSignal;
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([userSignal, timeoutSignal]);
+  }
+  const controller = new AbortController();
+  if (userSignal.aborted) {
+    controller.abort(userSignal.reason);
+  } else {
+    userSignal.addEventListener('abort', () => controller.abort(userSignal.reason), { once: true });
+  }
+  timeoutSignal.addEventListener('abort', () => controller.abort(timeoutSignal.reason), { once: true });
+  return controller.signal;
 }
 
-export { verifyEventInclusion } from "./verify.js";
-export type { EventInclusionProof } from "./verify.js";
 export { signRequest } from "./signing.js";
 export type { SignRequestInput } from "./signing.js";
 
@@ -110,7 +123,8 @@ export class ExplorerApiClient {
     endpoint: string,
     options: RequestOptions = {}
   ): Promise<ApiResponse<T>> {
-    const url = this.buildUrl(endpoint, options.params);
+    const { params, signal, ...rest } = options;
+    const url = this.buildUrl(endpoint, params);
     const headers = this.buildHeaders(method);
     const timeoutMs = options.timeout ?? this.timeout;
 
@@ -261,6 +275,25 @@ export class ExplorerApiClient {
   }
 
   /**
+   * Iterate events with automatic cursor pagination (#1080).
+   *
+   * Returns a lazy, cancellable async iterator that follows `next_cursor`
+   * across pages. See `IterateEventsOptions` for filters, page size, bounds
+   * and cancellation.
+   *
+   * ```ts
+   * for await (const event of client.iterateEvents({ contract: 'C...', limit: 100 })) {
+   *   // ...
+   * }
+   * ```
+   */
+  iterateEvents<T = EventRecord>(
+    options: IterateEventsOptions = {},
+  ): EventIterator<T> {
+    return createEventIterator<T>(this, options, '/api/events');
+  }
+
+  /**
    * GET request helper.
    */
   async get<T>(
@@ -379,20 +412,8 @@ export class ExplorerApiClient {
   }
 }
 
-/**
- * API error response.
- */
-export class ApiError extends Error {
-  constructor(
-    public status: number,
-    public statusText: string,
-    public data: unknown,
-    public meta: ResponseMetadata
-  ) {
-    super(`API Error ${status}: ${statusText}`);
-    Object.setPrototypeOf(this, ApiError.prototype);
-  }
-}
+// NOTE: The `ApiError` class (and its typed subclasses) now live in
+// `errors.ts` and are re-exported above for backwards compatibility.
 
 /**
  * Create a default client instance.

@@ -514,6 +514,12 @@ paths:
             type: integer
             example: 42
           description: Legacy event seq cursor; omit for the first page
+        - name: fields
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Comma-separated list of fields to return (safe documented subset)
         - name: limit
           in: query
           required: false
@@ -817,6 +823,12 @@ paths:
             type: integer
             example: 42
           description: Event seq cursor from the previous page
+        - name: fields
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Comma-separated list of fields to return (safe documented subset)
         - name: limit
           in: query
           required: false
@@ -7613,6 +7625,22 @@ components:
         count_is_estimate:
           type: boolean
           description: True when total count is approximate (reltuples/planner)
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartialDataWarning"
+          description: Structured warnings when data is incomplete
+
+    PartialDataWarning:
+      type: object
+      required: [code, message]
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          enum: [indexer_lag, metadata_unavailable, provider_unavailable]
+        message:
+          type: string
 
     SearchResponse:
       type: object

@@ -107,6 +107,15 @@ export function updateIndexerStatus(ledger, lagSeconds, ledgerLag = 0) {
 }
 
 /**
+ * Snapshot of the last-reported indexer status. Used by the partial-data
+ * warning builder (#1079) to tell whether the indexer is behind the network.
+ * Returns a copy so callers cannot mutate the internal state.
+ */
+export function getIndexerStatus() {
+  return { ..._indexerStatus };
+}
+
+/**
  * Update worker health status (called from worker jobs)
  */
 export function updateWorkerStatus(errorCount = 0) {

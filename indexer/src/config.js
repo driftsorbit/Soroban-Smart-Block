@@ -314,6 +314,16 @@ const configSchema = z
       .default(true),
 
     CURSOR_SIGNING_SECRET: z.string().default("soroban-smart-block-cursor-secret-key-32chars!"),
+
+    // ── Partial-data warnings (#1079) ───────────────────────────────────────────
+    // Seconds of indexer lag above which responses carry an `indexer_lag`
+    // warning. 0 warns on any non-zero lag.
+    PARTIAL_DATA_LAG_THRESHOLD_SECONDS: nonNegativeInt(30),
+
+    // ── Event field selection (#1078) ────────────────────────────────────────────
+    // Maximum number of fields a client may request via `?fields=`. Bounds the
+    // work and response size a single request can ask for.
+    EVENT_FIELDS_MAX: positiveInt(25),
   })
   .superRefine((val, ctx) => {
     // requireApiKey() in api.js fails OPEN (allows the request through) when
