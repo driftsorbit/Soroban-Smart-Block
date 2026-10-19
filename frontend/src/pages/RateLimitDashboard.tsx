@@ -125,7 +125,7 @@ export default function RateLimitDashboard() {
     fetchAll();
     const id = setInterval(fetchAll, 5_000);
     return () => clearInterval(id);
-  }, [fetchAll]);
+  }, [fetchAll, adminToken]);
 
   // Re-fetch top users when window changes
   useEffect(() => {
@@ -134,7 +134,7 @@ export default function RateLimitDashboard() {
       .then((r) => r.json())
       .then(setTopUsers)
       .catch(() => {});
-  }, [topWindow, authed, buildHeaders]);
+  }, [topWindow, authed, buildHeaders, adminToken]);
 
   // Login screen
   if (!adminToken || !authed) {

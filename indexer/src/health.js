@@ -13,8 +13,28 @@
 
 import { db, pool } from "./db.js";
 import * as alertManager from "./alertManager.js";
+import { getRpcNodeStatus } from "./rpcMultiNode.js";
 
 const { getActiveAlerts } = alertManager;
+
+let _rpcStatusOverride = null;
+let _dbStatusOverride = null;
+
+/**
+ * Override RPC node status for unit testing without live network dependencies.
+ * @param {object|null} override
+ */
+export function setRpcStatusOverride(override) {
+  _rpcStatusOverride = override;
+}
+
+/**
+ * Override DB status for unit testing without live network dependencies.
+ * @param {object|null} override
+ */
+export function setDbStatusOverride(override) {
+  _dbStatusOverride = override;
+}
 
 // ── Configurable thresholds ───────────────────────────────────────────────────
 // INDEXER_LAG_THRESHOLD_SECONDS: Threshold above which indexer is marked unhealthy
@@ -87,6 +107,15 @@ export function updateIndexerStatus(ledger, lagSeconds, ledgerLag = 0) {
 }
 
 /**
+ * Snapshot of the last-reported indexer status. Used by the partial-data
+ * warning builder (#1079) to tell whether the indexer is behind the network.
+ * Returns a copy so callers cannot mutate the internal state.
+ */
+export function getIndexerStatus() {
+  return { ..._indexerStatus };
+}
+
+/**
  * Update worker health status (called from worker jobs)
  */
 export function updateWorkerStatus(errorCount = 0) {
@@ -120,29 +149,52 @@ export function reportWorkerError() {
  * Tests connection and response time
  */
 async function checkDatabase() {
+  if (_dbStatusOverride !== null) {
+    return { ..._dbStatusOverride };
+  }
   const start = Date.now();
   try {
     await db.query("SELECT 1 AS health_check");
     const responseTime = Date.now() - start;
 
     // Get pool stats
-    const totalCount = pool.totalCount || 0;
-    const idleCount = pool.idleCount || 0;
-    const waitingCount = pool.waitingCount || 0;
+    const totalCount = pool?.totalCount || 0;
+    const idleCount = pool?.idleCount || 0;
+    const waitingCount = pool?.waitingCount || 0;
+    const maxCount = pool?.options?.max || 10;
+    const activeCount = Math.max(0, totalCount - idleCount);
+
+    const statsFromDb = typeof db?.getPoolStats === "function" ? db.getPoolStats() : null;
+    const saturation = statsFromDb?.saturation ?? (maxCount > 0 ? Number((activeCount / maxCount).toFixed(4)) : 0);
+    const avgWaitTimeMs = statsFromDb?.avgWaitTimeMs ?? 0;
+    const maxWaitTimeMs = statsFromDb?.maxWaitTimeMs ?? 0;
+
+    const poolStats = {
+      total: totalCount,
+      idle: idleCount,
+      active: activeCount,
+      waiting: waitingCount,
+      max: maxCount,
+      saturation,
+      avgWaitTimeMs,
+      maxWaitTimeMs,
+    };
+
+    // Alert proactively if pool is saturated
+    if (typeof alertManager?.checkDbPoolSaturation === "function") {
+      await alertManager.checkDbPoolSaturation(poolStats);
+    }
     
     return {
       status: "healthy",
+      ready: true,
       responseTime,
-      connections: {
-        total: totalCount,
-        idle: idleCount,
-        active: totalCount - idleCount,
-        waiting: waitingCount,
-      },
+      connections: poolStats,
     };
   } catch (err) {
     return {
       status: "unhealthy",
+      ready: false,
       error: err.message,
       responseTime: Date.now() - start,
     };
@@ -155,7 +207,7 @@ async function checkDatabase() {
  */
 async function checkCache() {
   if (!_redisClient) {
-    return { status: "disabled", message: "Redis not configured" };
+    return { status: "disabled", ready: true, optional: true, message: "Redis not configured" };
   }
 
   const start = Date.now();
@@ -164,6 +216,8 @@ async function checkCache() {
     if (!_redisClient.isOpen) {
       return {
         status: "unhealthy",
+        ready: false,
+        optional: false,
         error: "Redis client not connected",
         responseTime: Date.now() - start,
       };
@@ -194,14 +248,60 @@ async function checkCache() {
 
     return {
       status: "healthy",
+      ready: true,
+      optional: false,
       responseTime,
       ...info,
     };
   } catch (err) {
     return {
       status: "unhealthy",
+      ready: false,
+      optional: false,
       error: err.message,
       responseTime: Date.now() - start,
+    };
+  }
+}
+
+/**
+ * Check Soroban RPC dependency readiness
+ * Reports node status, response times, and healthy provider counts
+ */
+export async function checkRpc() {
+  if (_rpcStatusOverride !== null) {
+    return { ..._rpcStatusOverride };
+  }
+
+  const start = Date.now();
+  try {
+    let nodes = [];
+    try {
+      nodes = typeof getRpcNodeStatus === "function" ? getRpcNodeStatus() : [];
+    } catch {
+      nodes = [];
+    }
+
+    const healthyNodes = nodes.filter((n) => n.healthy);
+    const isReady = nodes.length === 0 ? true : healthyNodes.length > 0;
+
+    return {
+      status: isReady ? "healthy" : "unhealthy",
+      ready: isReady,
+      responseTime: Date.now() - start,
+      totalNodes: nodes.length,
+      healthyNodes: healthyNodes.length,
+      primary: nodes[0]?.url ?? null,
+      nodes: nodes.map(({ url, healthy, latestLedger }) => ({ url, healthy, latestLedger })),
+    };
+  } catch (err) {
+    return {
+      status: "unhealthy",
+      ready: false,
+      error: err.message,
+      responseTime: Date.now() - start,
+      totalNodes: 0,
+      healthyNodes: 0,
     };
   }
 }
@@ -243,9 +343,10 @@ function checkWorkers() {
  * Returns detailed status for all dependencies
  */
 export async function getHealthStatus() {
-  const [database, cache, stats] = await Promise.all([
+  const [database, cache, rpc, stats] = await Promise.all([
     checkDatabase(),
     checkCache(),
+    checkRpc(),
     getIndexerStats().catch(() => ({ total_events: null, events_per_minute: null, decode_success_rate: null })),
   ]);
 
@@ -256,7 +357,7 @@ export async function getHealthStatus() {
 
   // Overall status: healthy if all critical dependencies are healthy
   // Cache is optional, workers are degradable
-  const criticalHealthy = database.status === "healthy" && indexer.status === "healthy";
+  const criticalHealthy = database.status === "healthy" && indexer.status === "healthy" && (rpc.status === "healthy" || rpc.ready === true);
   const allHealthy = criticalHealthy &&
     (cache.status === "healthy" || cache.status === "disabled") &&
     workers.status === "healthy";
@@ -267,6 +368,7 @@ export async function getHealthStatus() {
     dependencies: {
       database,
       cache,
+      rpc,
       indexer,
       workers,
       replicas: { configured: replicas.length, healthy: replicas.filter((replica) => replica.healthy).length, instances: replicas },
@@ -313,19 +415,81 @@ export function setDraining(value = true) {
   draining = value;
 }
 
-export async function getReadinessStatus() {
-  if (draining) {
-    return { status: "not_ready", timestamp: new Date().toISOString(), reason: "Draining for shutdown", dependencies: {} };
+export async function getReadinessStatus(options = {}) {
+  const dependencyParam = typeof options === "string" ? options : options?.dependency;
+
+  if (dependencyParam) {
+    const validDeps = ["database", "cache", "rpc"];
+    const normalized = String(dependencyParam).toLowerCase().trim();
+    if (!validDeps.includes(normalized)) {
+      return {
+        valid: false,
+        statusCode: 400,
+        error: `Invalid dependency: '${dependencyParam}'. Supported dependencies: ${validDeps.join(", ")}`,
+      };
+    }
+
+    if (draining) {
+      return {
+        status: "not_ready",
+        ready: false,
+        timestamp: new Date().toISOString(),
+        dependency: normalized,
+        reason: "Draining for shutdown",
+        details: {},
+      };
+    }
+
+    let depResult;
+    if (normalized === "database") depResult = await checkDatabase();
+    else if (normalized === "cache") depResult = await checkCache();
+    else if (normalized === "rpc") depResult = await checkRpc();
+
+    const isReady = depResult.ready !== false && depResult.status !== "unhealthy";
+    return {
+      status: isReady ? "ready" : "not_ready",
+      ready: isReady,
+      timestamp: new Date().toISOString(),
+      dependency: normalized,
+      reason: isReady ? null : (depResult.error || `${normalized} is not ready`),
+      details: depResult,
+    };
   }
-  const health = await getHealthStatus();
-  
-  // Ready if status is healthy or degraded (not unhealthy)
-  const ready = health.status !== "unhealthy";
-  
+
+  if (draining) {
+    return { status: "not_ready", ready: false, timestamp: new Date().toISOString(), reason: "Draining for shutdown", dependencies: {} };
+  }
+
+  const [database, cache, rpc] = await Promise.all([
+    checkDatabase(),
+    checkCache(),
+    checkRpc(),
+  ]);
+
+  const indexer = checkIndexer();
+  const dbReady = database.ready !== false && database.status === "healthy";
+  const cacheReady = cache.ready !== false && cache.status !== "unhealthy";
+  const rpcReady = rpc.ready !== false && rpc.status !== "unhealthy";
+  const indexerReady = indexer.status === "healthy";
+
+  const isReady = dbReady && cacheReady && rpcReady && indexerReady;
+
+  const unreadyReasons = [];
+  if (!dbReady) unreadyReasons.push("database unhealthy");
+  if (!cacheReady) unreadyReasons.push("cache unhealthy");
+  if (!rpcReady) unreadyReasons.push("rpc unhealthy");
+  if (!indexerReady) unreadyReasons.push("indexer sync lag unhealthy");
+
   return {
-    status: ready ? "ready" : "not_ready",
+    status: isReady ? "ready" : "not_ready",
+    ready: isReady,
     timestamp: new Date().toISOString(),
-    reason: ready ? null : "Critical dependencies unhealthy",
-    dependencies: health.dependencies,
+    reason: isReady ? null : `Critical dependencies unhealthy: ${unreadyReasons.join(", ")}`,
+    dependencies: {
+      database,
+      cache,
+      rpc,
+      indexer,
+    },
   };
 }

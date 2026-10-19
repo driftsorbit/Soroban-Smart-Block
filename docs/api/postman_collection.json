@@ -1,6 +1,91 @@
 {
   "item": [
     {
+      "name": "Get an indexed Soroban transaction, including failed transactions and fee breakdown",
+      "request": {
+        "name": "Get an indexed Soroban transaction, including failed transactions and fee breakdown",
+        "description": {},
+        "url": {
+          "path": [
+            "api",
+            "tx",
+            ":hash"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [],
+          "variable": [
+            {
+              "disabled": false,
+              "type": "any",
+              "value": "<string>",
+              "key": "hash",
+              "description": "(Required) "
+            }
+          ]
+        },
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "GET",
+        "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "List transactions sent or fee-paid by an account",
+      "request": {
+        "name": "List transactions sent or fee-paid by an account",
+        "description": {},
+        "url": {
+          "path": [
+            "api",
+            "accounts",
+            ":id",
+            "transactions"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [
+            {
+              "disabled": false,
+              "key": "limit",
+              "value": "50"
+            }
+          ],
+          "variable": [
+            {
+              "disabled": false,
+              "type": "any",
+              "value": "<string>",
+              "key": "id",
+              "description": "(Required) "
+            }
+          ]
+        },
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "GET",
+        "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
       "name": "Comprehensive health check endpoint",
       "request": {
         "name": "Comprehensive health check endpoint",
@@ -49,6 +134,46 @@
             "{{baseUrl}}"
           ],
           "query": [],
+          "variable": []
+        },
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "GET",
+        "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Capability-discovery endpoint",
+      "request": {
+        "name": "Capability-discovery endpoint",
+        "description": {
+          "content": "Exposes supported networks, API versions, pagination modes, transports, and feature flags in a cacheable response.\n",
+          "type": "text/plain"
+        },
+        "url": {
+          "path": [
+            "api",
+            "capabilities"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [
+            {
+              "disabled": false,
+              "key": "network",
+              "value": "<string>",
+              "description": "Optional network name to filter capabilities for"
+            }
+          ],
           "variable": []
         },
         "header": [
@@ -279,6 +404,200 @@
         ],
         "method": "GET",
         "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Resume the live event feed over Server-Sent Events",
+      "request": {
+        "name": "Resume the live event feed over Server-Sent Events",
+        "description": {
+          "content": "Starts live when no cursor is supplied. With a cursor, replays persisted events before resuming live delivery. Resume with Last-Event-ID or after_seq; reconnect with the last received event id after backpressure.",
+          "type": "text/plain"
+        },
+        "url": {
+          "path": [
+            "api",
+            "events",
+            "stream"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [
+            {
+              "disabled": false,
+              "key": "after_seq",
+              "value": "<integer>"
+            },
+            {
+              "disabled": false,
+              "key": "network",
+              "value": "<string>"
+            }
+          ],
+          "variable": []
+        },
+        "header": [
+          {
+            "key": "Accept",
+            "value": "text/event-stream"
+          }
+        ],
+        "method": "GET",
+        "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Execute curated analytics SQL query",
+      "request": {
+        "name": "Execute curated analytics SQL query",
+        "description": {
+          "content": "Executes a read-only query against curated analytics views. Supports conditional requests via ETag and X-Ledger-Watermark headers.\n",
+          "type": "text/plain"
+        },
+        "url": {
+          "path": [
+            "api",
+            "sql"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [],
+          "variable": []
+        },
+        "header": [
+          {
+            "disabled": false,
+            "description": "Entity tag validator for conditional requests",
+            "key": "If-None-Match",
+            "value": "<string>"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "POST",
+        "auth": null,
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"<string>\",\n  \"format\": \"json\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Execute curated analytics SQL query via GET",
+      "request": {
+        "name": "Execute curated analytics SQL query via GET",
+        "description": {
+          "content": "Executes a read-only query against curated analytics views. Supports conditional requests via ETag and X-Ledger-Watermark headers.\n",
+          "type": "text/plain"
+        },
+        "url": {
+          "path": [
+            "api",
+            "sql"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [
+            {
+              "disabled": false,
+              "key": "query",
+              "value": "<string>",
+              "description": "(Required) Analytics SQL query to execute"
+            },
+            {
+              "disabled": false,
+              "key": "format",
+              "value": "json",
+              "description": "Response format"
+            }
+          ],
+          "variable": []
+        },
+        "header": [
+          {
+            "disabled": false,
+            "description": "Entity tag validator for conditional requests",
+            "key": "If-None-Match",
+            "value": "<string>"
+          },
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "GET",
+        "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Query events, contracts, wallets, and sub-invocations",
+      "request": {
+        "name": "Query events, contracts, wallets, and sub-invocations",
+        "description": {
+          "content": "Queries are limited to depth 4, complexity 1000, and 100 records per list field.",
+          "type": "text/plain"
+        },
+        "url": {
+          "path": [
+            "graphql"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [],
+          "variable": []
+        },
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "POST",
+        "auth": null,
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"<string>\",\n  \"variables\": \"<object>\",\n  \"operationName\": \"<string>\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
       },
       "event": [],
       "protocolProfileBehavior": {
@@ -636,11 +955,99 @@
       }
     },
     {
+      "name": "Bulk contract metadata lookup",
+      "request": {
+        "name": "Bulk contract metadata lookup",
+        "description": {
+          "content": "Accepts a bounded list of contract IDs (up to 100) and returns per-item found or not-found metadata results.\n",
+          "type": "text/plain"
+        },
+        "url": {
+          "path": [
+            "api",
+            "contracts",
+            "bulk"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [],
+          "variable": []
+        },
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "POST",
+        "auth": null,
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"contract_ids\": [\n    \"<string>\",\n    \"<string>\"\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Bulk contract metadata lookup via query parameter",
+      "request": {
+        "name": "Bulk contract metadata lookup via query parameter",
+        "description": {
+          "content": "Returns contract metadata for a comma-separated list of contract IDs (up to 100).",
+          "type": "text/plain"
+        },
+        "url": {
+          "path": [
+            "api",
+            "contracts",
+            "bulk"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [
+            {
+              "disabled": false,
+              "key": "ids",
+              "value": "<string>",
+              "description": "Comma-separated list of contract IDs (max 100)"
+            }
+          ],
+          "variable": []
+        },
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "GET",
+        "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
       "name": "List registered contracts",
       "request": {
         "name": "List registered contracts",
         "description": {
-          "content": "Returns a paginated list of registered contracts. Supports filtering by protocol type.",
+          "content": "Returns a cursor-paginated list. Pass next_cursor as after for the next page. Numbered pages beyond page 1 are rejected. Private contracts are visible only to their registering API-key owner.",
           "type": "text/plain"
         },
         "url": {
@@ -765,7 +1172,7 @@
         },
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"id\": \"<string>\",\n  \"functions\": [\n    {\n      \"name\": \"<string>\",\n      \"args\": [\n        {\n          \"name\": \"<string>\",\n          \"type\": \"<string>\"\n        },\n        {\n          \"name\": \"<string>\",\n          \"type\": \"<string>\"\n        }\n      ],\n      \"description\": \"<string>\"\n    },\n    {\n      \"name\": \"<string>\",\n      \"args\": [\n        {\n          \"name\": \"<string>\",\n          \"type\": \"<string>\"\n        },\n        {\n          \"name\": \"<string>\",\n          \"type\": \"<string>\"\n        }\n      ],\n      \"description\": \"<string>\"\n    }\n  ],\n  \"name\": \"<string>\",\n  \"description\": \"<string>\",\n  \"protocol_type\": \"<string>\"\n}",
+          "raw": "{\n  \"id\": \"<string>\",\n  \"functions\": [\n    {\n      \"name\": \"<string>\",\n      \"args\": [\n        {\n          \"name\": \"<string>\",\n          \"type\": \"<string>\"\n        },\n        {\n          \"name\": \"<string>\",\n          \"type\": \"<string>\"\n        }\n      ],\n      \"description\": \"<string>\"\n    },\n    {\n      \"name\": \"<string>\",\n      \"args\": [\n        {\n          \"name\": \"<string>\",\n          \"type\": \"<string>\"\n        },\n        {\n          \"name\": \"<string>\",\n          \"type\": \"<string>\"\n        }\n      ],\n      \"description\": \"<string>\"\n    }\n  ],\n  \"name\": \"<string>\",\n  \"description\": \"<string>\",\n  \"protocol_type\": \"<string>\",\n  \"is_private\": false\n}",
           "options": {
             "raw": {
               "language": "json"
@@ -783,7 +1190,7 @@
       "request": {
         "name": "Get events involving a wallet address",
         "description": {
-          "content": "Returns a list of events associated with a specific Stellar/Soroban wallet address.",
+          "content": "Returns a cursor-paginated event history for a Stellar/Soroban wallet. Pass next_cursor as after_seq to continue.",
           "type": "text/plain"
         },
         "url": {
@@ -801,6 +1208,26 @@
               "key": "fn",
               "value": "<string>",
               "description": "Comma-separated event-type categories to filter by (transfer/swap/mint/burn/stake match by prefix, e.g. \"swap\" also matches \"swap_exact_tokens_for_tokens\"; \"other\" matches any function outside those categories). Omit to return all events."
+            },
+            {
+              "disabled": false,
+              "key": "after_seq",
+              "value": "<integer>"
+            },
+            {
+              "disabled": false,
+              "key": "limit",
+              "value": "25"
+            },
+            {
+              "disabled": false,
+              "key": "from",
+              "value": "<date>"
+            },
+            {
+              "disabled": false,
+              "key": "to",
+              "value": "<date>"
             }
           ],
           "variable": [
@@ -1188,7 +1615,7 @@
       "request": {
         "name": "List events for a specific contract",
         "description": {
-          "content": "Returns paginated decoded events emitted by the given contract.",
+          "content": "Returns decoded events using a stable sequence cursor. Page jumps are not supported.",
           "type": "text/plain"
         },
         "url": {
@@ -1850,7 +2277,7 @@
       "request": {
         "name": "Add a multi-signature source verification for a contract",
         "description": {
-          "content": "Submits a new WASM source verification record signed by a verifier.",
+          "content": "Submits a new WASM source verification record. The API verifies a Stellar Ed25519 signature over `soroban-source-verification:v1:<wasm_hash>:<compiler_hash>` before storing it.",
           "type": "text/plain"
         },
         "url": {
@@ -3557,7 +3984,7 @@
             },
             {
               "disabled": false,
-              "key": "offset",
+              "key": "after",
               "value": "0",
               "description": "Legacy offset (deprecated)"
             }
@@ -3644,8 +4071,9 @@
             },
             {
               "disabled": false,
-              "key": "offset",
-              "value": "0"
+              "key": "after",
+              "value": "<string>",
+              "description": "Opaque timestamp/id cursor from the previous response"
             }
           ],
           "variable": []
@@ -4224,6 +4652,12 @@
             },
             {
               "disabled": false,
+              "key": "after_seq",
+              "value": "<integer>",
+              "description": "Event sequence cursor from the previous export response header"
+            },
+            {
+              "disabled": false,
               "key": "limit",
               "value": "10000"
             }
@@ -4245,9 +4679,497 @@
       }
     },
     {
-      "name": "Export all registered contracts as CSV or JSON",
+      "name": "Per-ledger network metrics (TPS, close time, fee percentiles, utilization, surge)",
       "request": {
-        "name": "Export all registered contracts as CSV or JSON",
+        "name": "Per-ledger network metrics (TPS, close time, fee percentiles, utilization, surge)",
+        "description": {},
+        "url": {
+          "path": [
+            "api",
+            "network",
+            "metrics"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [
+            {
+              "disabled": false,
+              "key": "range",
+              "value": "1h"
+            }
+          ],
+          "variable": []
+        },
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "GET",
+        "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "List indexed ledgers, newest first (#912)",
+      "request": {
+        "name": "List indexed ledgers, newest first (#912)",
+        "description": {},
+        "url": {
+          "path": [
+            "api",
+            "ledgers"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [
+            {
+              "disabled": false,
+              "key": "cursor",
+              "value": "<string>",
+              "description": "Return ledgers with a sequence lower than this (the previous page's next_cursor)"
+            },
+            {
+              "disabled": false,
+              "key": "limit",
+              "value": "20"
+            }
+          ],
+          "variable": []
+        },
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "GET",
+        "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Ledger detail — header, protocol version, fees, utilization and Soroban txs (#912)",
+      "request": {
+        "name": "Ledger detail — header, protocol version, fees, utilization and Soroban txs (#912)",
+        "description": {
+          "content": "Ledgers older than the indexer's retention window return 200 with status \"not_indexed\". Ledgers inside an open gap return status \"gap\" with the gap record. Sequences beyond the indexed tip return 404.\n",
+          "type": "text/plain"
+        },
+        "url": {
+          "path": [
+            "api",
+            "ledgers",
+            ":seq"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [],
+          "variable": [
+            {
+              "disabled": false,
+              "type": "any",
+              "value": "<integer>",
+              "key": "seq",
+              "description": "(Required) "
+            }
+          ]
+        },
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "GET",
+        "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Queue a reproducible-build source verification (#796)",
+      "request": {
+        "name": "Queue a reproducible-build source verification (#796)",
+        "description": {
+          "content": "Submits source coordinates only. The verifier builds the WASM in a pinned container and compares sha256(wasm) with the on-chain code hash; submitted metadata can never mark a contract verified.\n",
+          "type": "text/plain"
+        },
+        "url": {
+          "path": [
+            "api",
+            "contracts",
+            ":id",
+            "code-verifications"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [],
+          "variable": [
+            {
+              "disabled": false,
+              "type": "any",
+              "value": "<string>",
+              "key": "id",
+              "description": "(Required) "
+            }
+          ]
+        },
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "method": "POST",
+        "auth": {
+          "type": "apikey",
+          "apikey": [
+            {
+              "key": "key",
+              "value": "x-api-key"
+            },
+            {
+              "key": "value",
+              "value": "{{apiKey}}"
+            },
+            {
+              "key": "in",
+              "value": "header"
+            }
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"source_repo\": \"<string>\",\n  \"commit\": \"<string>\",\n  \"toolchain\": {\n    \"rust\": \"<string>\",\n    \"soroban_sdk\": \"<string>\",\n    \"stellar_cli\": \"<string>\"\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Source-verification badge and trust details (#796)",
+      "request": {
+        "name": "Source-verification badge and trust details (#796)",
+        "description": {},
+        "url": {
+          "path": [
+            "api",
+            "contracts",
+            ":id",
+            "code-verification"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [],
+          "variable": [
+            {
+              "disabled": false,
+              "type": "any",
+              "value": "<string>",
+              "key": "id",
+              "description": "(Required) "
+            }
+          ]
+        },
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "method": "GET",
+        "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "List dead-letter-queue entries (#851)",
+      "request": {
+        "name": "List dead-letter-queue entries (#851)",
+        "description": {},
+        "url": {
+          "path": [
+            "api",
+            "admin",
+            "dlq"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [
+            {
+              "disabled": false,
+              "key": "state",
+              "value": "<string>"
+            },
+            {
+              "disabled": false,
+              "key": "error_class",
+              "value": "<string>"
+            },
+            {
+              "disabled": false,
+              "key": "page",
+              "value": "<integer>"
+            },
+            {
+              "disabled": false,
+              "key": "limit",
+              "value": "<integer>"
+            }
+          ],
+          "variable": []
+        },
+        "method": "GET",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{bearerToken}}"
+            }
+          ]
+        }
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Retry a DLQ entry now (also un-quarantines it) (#851)",
+      "request": {
+        "name": "Retry a DLQ entry now (also un-quarantines it) (#851)",
+        "description": {},
+        "url": {
+          "path": [
+            "api",
+            "admin",
+            "dlq",
+            ":id",
+            "retry"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [],
+          "variable": [
+            {
+              "disabled": false,
+              "type": "any",
+              "value": "<integer>",
+              "key": "id",
+              "description": "(Required) "
+            }
+          ]
+        },
+        "method": "POST",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{bearerToken}}"
+            }
+          ]
+        }
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Mark a DLQ entry resolved (#851)",
+      "request": {
+        "name": "Mark a DLQ entry resolved (#851)",
+        "description": {},
+        "url": {
+          "path": [
+            "api",
+            "admin",
+            "dlq",
+            ":id",
+            "resolve"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [],
+          "variable": [
+            {
+              "disabled": false,
+              "type": "any",
+              "value": "<integer>",
+              "key": "id",
+              "description": "(Required) "
+            }
+          ]
+        },
+        "method": "POST",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{bearerToken}}"
+            }
+          ]
+        }
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Bulk re-queue open DLQ entries of one error class (#851)",
+      "request": {
+        "name": "Bulk re-queue open DLQ entries of one error class (#851)",
+        "description": {},
+        "url": {
+          "path": [
+            "api",
+            "admin",
+            "dlq",
+            "replay"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [
+            {
+              "disabled": false,
+              "key": "error_class",
+              "value": "<string>",
+              "description": "(Required) "
+            }
+          ],
+          "variable": []
+        },
+        "method": "POST",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{bearerToken}}"
+            }
+          ]
+        }
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Issue a request-signing secret for an API key (#852)",
+      "request": {
+        "name": "Issue a request-signing secret for an API key (#852)",
+        "description": {
+          "content": "Returns the secret once. The previous secret remains valid (rotation overlap); older secrets are revoked. Mutating routes under /api/contracts, /api/abi and /api/admin accept X-SSB-Key-Id, X-SSB-Timestamp (unix seconds), X-SSB-Nonce and X-SSB-Signature = hex HMAC-SHA256(secret, METHOD \\n PATH \\n SHA256(raw body) \\n timestamp \\n nonce). With SIGNING_ENFORCED=on unsigned requests are rejected. Errors: 401 stale_timestamp (with server_time), 401 invalid_signature, 409 nonce_reused.\n",
+          "type": "text/plain"
+        },
+        "url": {
+          "path": [
+            "api",
+            "admin",
+            "api-keys",
+            ":id",
+            "signing-secret"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [],
+          "variable": [
+            {
+              "disabled": false,
+              "type": "any",
+              "value": "<string>",
+              "key": "id",
+              "description": "(Required) "
+            }
+          ]
+        },
+        "method": "POST",
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{bearerToken}}"
+            }
+          ]
+        }
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Server-sent stream of the latest ledger's network metrics",
+      "request": {
+        "name": "Server-sent stream of the latest ledger's network metrics",
+        "description": {},
+        "url": {
+          "path": [
+            "api",
+            "network",
+            "metrics",
+            "stream"
+          ],
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "query": [],
+          "variable": []
+        },
+        "header": [
+          {
+            "key": "Accept",
+            "value": "text/event-stream"
+          }
+        ],
+        "method": "GET",
+        "auth": null
+      },
+      "event": [],
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      }
+    },
+    {
+      "name": "Export registered contracts as CSV or JSON",
+      "request": {
+        "name": "Export registered contracts as CSV or JSON",
         "description": {},
         "url": {
           "path": [
@@ -4259,6 +5181,17 @@
             "{{baseUrl}}"
           ],
           "query": [
+            {
+              "disabled": false,
+              "key": "after",
+              "value": "<string>",
+              "description": "Opaque cursor from the previous export response header"
+            },
+            {
+              "disabled": false,
+              "key": "limit",
+              "value": "1000"
+            },
             {
               "disabled": false,
               "key": "format",

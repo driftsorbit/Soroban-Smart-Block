@@ -14,7 +14,7 @@ class SorobanExplorerClient:
         self.api_key = api_key
         self.timeout = timeout
 
-    def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, json_body: Optional[Dict[str, Any]] = None) -> Any:
+    def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, json_body: Optional[Dict[str, Any]] = None, timeout: Optional[int] = None) -> Any:
         headers = {"Accept": "application/json"}
         if self.api_key:
             headers["x-api-key"] = self.api_key
@@ -26,7 +26,7 @@ class SorobanExplorerClient:
             params=params,
             headers=headers,
             json=json_body,
-            timeout=self.timeout,
+            timeout=timeout if timeout is not None else self.timeout,
         )
         if not response.ok:
             try:
@@ -40,13 +40,13 @@ class SorobanExplorerClient:
         except ValueError:
             return response.text
 
-    def get_health(self) -> Dict[str, Any]:
-        return self._request("GET", "/api/health")
+    def get_health(self, timeout: Optional[int] = None) -> Dict[str, Any]:
+        return self._request("GET", "/api/health", timeout=timeout)
 
-    def get_event(self, seq: int) -> Dict[str, Any]:
-        return self._request("GET", f"/api/events/{seq}")
+    def get_event(self, seq: int, timeout: Optional[int] = None) -> Dict[str, Any]:
+        return self._request("GET", f"/api/events/{seq}", timeout=timeout)
 
-    def get_events(self, contract: Optional[str] = None, fn: Optional[str] = None, type: Optional[str] = None, after_seq: Optional[int] = None, limit: int = 25) -> Dict[str, Any]:
+    def get_events(self, contract: Optional[str] = None, fn: Optional[str] = None, type: Optional[str] = None, after_seq: Optional[int] = None, limit: int = 25, timeout: Optional[int] = None) -> Dict[str, Any]:
         params: Dict[str, Any] = {"limit": limit}
         if contract is not None:
             params["contract"] = contract
@@ -56,26 +56,26 @@ class SorobanExplorerClient:
             params["type"] = type
         if after_seq is not None:
             params["after_seq"] = after_seq
-        return self._request("GET", "/api/events", params=params)
+        return self._request("GET", "/api/events", params=params, timeout=timeout)
 
-    def get_contract(self, contract_id: str) -> Dict[str, Any]:
-        return self._request("GET", f"/api/contracts/{contract_id}")
+    def get_contract(self, contract_id: str, timeout: Optional[int] = None) -> Dict[str, Any]:
+        return self._request("GET", f"/api/contracts/{contract_id}", timeout=timeout)
 
-    def list_contracts(self, page: int = 1, limit: int = 25, type: Optional[str] = None, q: Optional[str] = None) -> Dict[str, Any]:
+    def list_contracts(self, page: int = 1, limit: int = 25, type: Optional[str] = None, q: Optional[str] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
         params: Dict[str, Any] = {"page": page, "limit": limit}
         if type is not None:
             params["type"] = type
         if q is not None:
             params["q"] = q
-        return self._request("GET", "/api/contracts", params=params)
+        return self._request("GET", "/api/contracts", params=params, timeout=timeout)
 
-    def get_wallet(self, address: str, from_date: Optional[str] = None, to_date: Optional[str] = None) -> Dict[str, Any]:
+    def get_wallet(self, address: str, from_date: Optional[str] = None, to_date: Optional[str] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
         if from_date is not None:
             params["from"] = from_date
         if to_date is not None:
             params["to"] = to_date
-        return self._request("GET", f"/api/wallet/{address}", params=params)
+        return self._request("GET", f"/api/wallet/{address}", params=params, timeout=timeout)
 
-    def search(self, query: str, limit: int = 10) -> Dict[str, Any]:
-        return self._request("GET", "/api/search", params={"q": query, "limit": limit})
+    def search(self, query: str, limit: int = 10, timeout: Optional[int] = None) -> Dict[str, Any]:
+        return self._request("GET", "/api/search", params={"q": query, "limit": limit}, timeout=timeout)

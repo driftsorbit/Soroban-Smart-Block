@@ -20,6 +20,7 @@ import crypto from "crypto";
 import { db } from "./db.js";
 import { enqueue as dlqEnqueue } from "./deadLetterQueue.js";
 import { decryptSecret } from "./secrets/index.js";
+import { assertSafeUrl, safeFetch } from "./safeHttp.js";
 
 const DELIVERY_TIMEOUT_MS = 5_000;
 const MAX_RESPONSE_BODY_CHARS = 4_000;
@@ -89,6 +90,7 @@ async function sendOnce(url, secret, body) {
       headers: {
         "Content-Type": "application/json",
         "X-Webhook-Signature": signPayload(decryptSecret(secret), body),
+        "X-Webhook-Timestamp": String(Math.floor(Date.now() / 1000)),
       },
       body,
       timeoutMs: DELIVERY_TIMEOUT_MS,
@@ -130,7 +132,13 @@ async function deliverToSubscription(sub, decoded) {
 
   if (!outcome.success) {
     await dlqEnqueue(
-      { kind: "webhook_delivery", webhook_id: sub.id, event_seq: decoded.seq ?? null, url: sub.url, request_body: body },
+      {
+        kind: "webhook_delivery",
+        webhook_id: sub.id,
+        event_seq: decoded.seq ?? null,
+        url: sub.url,
+        request_body: body,
+      },
       outcome.error ?? new Error("webhook delivery failed"),
     ).catch(() => {});
   }

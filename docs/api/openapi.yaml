@@ -76,6 +76,50 @@ paths:
           description: Transaction record
           content: { application/json: { schema: { $ref: '#/components/schemas/Transaction' } } }
         '404': { description: Transaction not found }
+  /api/tx/{hash}/events:
+    get:
+      summary: Get all indexed events for a transaction with stable ordering
+      description: Returns all indexed transaction events in deterministic order with bounded response size.
+      parameters:
+        - in: path
+          name: hash
+          required: true
+          schema: { type: string }
+          description: Transaction hash
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: Maximum number of events to return (bounded 1..200)
+        - in: query
+          name: offset
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+          description: Number of events to skip
+        - in: query
+          name: order
+          required: false
+          schema: { type: string, enum: [asc, desc], default: asc }
+          description: Sorting direction for deterministic ordering
+      responses:
+        '200':
+          description: Deterministically ordered transaction events
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionEventsResponse'
+        '422':
+          description: Invalid input parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /api/accounts/{id}/transactions:
     get:
       summary: List transactions sent or fee-paid by an account
@@ -146,6 +190,46 @@ paths:
                   - $ref: "#/components/schemas/HealthStatus"
                   - $ref: "#/components/schemas/HealthErrorStatus"
 
+  /api/capabilities:
+    get:
+      summary: Capability-discovery endpoint
+      operationId: getCapabilities
+      security: []
+      description: |
+        Exposes supported networks, API versions, pagination modes, transports, and feature flags in a cacheable response.
+      parameters:
+        - name: network
+          in: query
+          required: false
+          description: Optional network name to filter capabilities for
+          schema:
+            type: string
+            enum: [testnet, mainnet, futurenet]
+      responses:
+        "200":
+          description: API capabilities summary
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Entity tag for conditional validation.
+            Cache-Control:
+              schema:
+                type: string
+              description: Caching directives.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiCapabilities"
+        "304":
+          description: Capabilities have not changed since previous request.
+        "400":
+          description: Invalid or unsupported network query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /api/alerts:
     get:
       summary: List active alert conditions
@@ -181,19 +265,158 @@ paths:
       description: |
         Kubernetes-style readiness check. Returns 200 if the service can handle
         traffic (dependencies are healthy). Returns 503 if dependencies are down.
+        Supports query parameter `dependency` to check an individual dependency (#1119).
+      parameters:
+        - name: dependency
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [database, cache, rpc]
+          description: Check readiness for a single dependency
       responses:
         "200":
-          description: Service is ready to handle traffic
+          description: Service or dependency is ready to handle traffic
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ReadinessStatus"
+        "400":
+          description: Invalid dependency query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "503":
-          description: Service is not ready (dependencies unhealthy)
+          description: Service or dependency is not ready
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ReadinessStatus"
+
+  /api/db/pool:
+    get:
+      summary: Database connection pool status and saturation metrics (#1116)
+      security: []
+      description: Returns active connections, idle connections, waiting clients, and pool saturation ratio.
+      responses:
+        "200":
+          description: Current pool metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PoolStatus"
+
+  /api/observability/latency:
+    get:
+      summary: Per-endpoint API latency distributions (#1117)
+      security: []
+      description: Returns low-cardinality route-family latency distributions distinguishing server from upstream latency.
+      parameters:
+        - name: route_family
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [events, contracts, tokens, transactions, wallets, rpc, health, system, admin, webhooks, other]
+          description: Filter distributions by route family
+      responses:
+        "200":
+          description: Latency distributions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LatencyDistributionsResponse"
+        "400":
+          description: Invalid route_family parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/operator/incidents:
+    get:
+      summary: Operator incident timeline (#1115)
+      security: []
+      description: Correlates deployments, provider changes, lag spikes, and recovery actions.
+      parameters:
+        - name: event_type
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [deployment, provider_change, lag_spike, recovery_action, alert_trigger, alert_resolve]
+        - name: severity
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [info, warning, critical]
+        - name: source
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: List of incident timeline events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperatorIncidentTimelineResponse"
+        "400":
+          description: Invalid filter parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    post:
+      summary: Record an operator incident event (#1115)
+      security: []
+      description: Records a deployment, provider change, lag spike, or recovery action.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OperatorIncidentCreateRequest"
+      responses:
+        "201":
+          description: Incident event recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperatorIncidentEvent"
+        "400":
+          description: Invalid event payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/csrf-token:
     get:
@@ -291,6 +514,12 @@ paths:
             type: integer
             example: 42
           description: Legacy event seq cursor; omit for the first page
+        - name: fields
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Comma-separated list of fields to return (safe documented subset)
         - name: limit
           in: query
           required: false
@@ -400,6 +629,132 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /api/sql:
+    post:
+      summary: Execute curated analytics SQL query
+      operationId: executeSqlAnalyticsPost
+      description: |
+        Executes a read-only query against curated analytics views. Supports conditional requests via ETag and X-Ledger-Watermark headers.
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Entity tag validator for conditional requests
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SqlAnalyticsRequest"
+      responses:
+        "200":
+          description: Analytics query results
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Entity tag based on query and ledger watermark
+            X-Ledger-Watermark:
+              schema:
+                type: string
+              description: Current indexed ledger watermark
+            Cache-Control:
+              schema:
+                type: string
+              description: Cache control directives
+          content:
+            application/json:
+              schema:
+                type: object
+            text/csv:
+              schema:
+                type: string
+        "304":
+          description: Results unchanged for current query and ledger watermark
+        "400":
+          description: Invalid query or disallowed SQL constructs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: Request payload exceeds size limit (1MB)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Analytics database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    get:
+      summary: Execute curated analytics SQL query via GET
+      operationId: executeSqlAnalyticsGet
+      description: |
+        Executes a read-only query against curated analytics views. Supports conditional requests via ETag and X-Ledger-Watermark headers.
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Analytics SQL query to execute
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [json, csv]
+            default: json
+          description: Response format
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Entity tag validator for conditional requests
+      responses:
+        "200":
+          description: Analytics query results
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Entity tag based on query and ledger watermark
+            X-Ledger-Watermark:
+              schema:
+                type: string
+              description: Current indexed ledger watermark
+            Cache-Control:
+              schema:
+                type: string
+              description: Cache control directives
+          content:
+            application/json:
+              schema:
+                type: object
+            text/csv:
+              schema:
+                type: string
+        "304":
+          description: Results unchanged for current query and ledger watermark
+        "400":
+          description: Invalid query or disallowed SQL constructs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Analytics database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /graphql:
     post:
       summary: Query events, contracts, wallets, and sub-invocations
@@ -468,6 +823,12 @@ paths:
             type: integer
             example: 42
           description: Event seq cursor from the previous page
+        - name: fields
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Comma-separated list of fields to return (safe documented subset)
         - name: limit
           in: query
           required: false
@@ -612,6 +973,14 @@ paths:
           description: >-
             Number of trailing days to include in the events_per_day series
             (1-365, default 30). The UI uses 30, 90, and 365-day presets.
+        - name: as_of_ledger
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            example: 1050000
+          description: Upper ledger sequence watermark to bound the stats query
       responses:
         "200":
           description: Contract statistics
@@ -654,6 +1023,59 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /api/contracts/{id}/activity-summary:
+    get:
+      summary: Contract activity summary
+      description: Provide bounded per-contract event counts by function and interval with partial-data indicators (#1073).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: "CC4VM2DTTR4QO4J4E5K2YUXM"
+          description: Contract ID
+        - name: interval
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [hour, day, week]
+            default: day
+          description: Time bucket granularity
+        - name: range
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Number of intervals to include (hour 1..168, day 1..90, week 1..52)
+        - name: as_of_ledger
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+          description: Upper ledger sequence watermark to bound the activity summary
+      responses:
+        "200":
+          description: Activity summary breakdown with partial-data indicators
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContractActivitySummaryResponse"
+        "422":
+          description: Invalid input parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /api/contracts/{id}/abi-history:
     get:
       summary: ABI version history for a contract (Issue #517)
@@ -683,6 +1105,202 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/AbiHistoryEntry"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/contracts/{id}/decode-coverage:
+    get:
+      summary: Per-function decode coverage over a ledger range (Issue #1058)
+      description: |
+        Reports, for each function the contract emitted in the inclusive ledger
+        range, how many events were decoded against an ABI or on-chain spec
+        (decode_status `verified` or `unverified`). Events decoded only by
+        heuristic guessing are not counted as decoded. `decode_share` is a ratio
+        between 0 and 1, rounded to four decimals, or null when there are no events.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Contract ID
+        - name: from_ledger
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+          description: First ledger of the range (inclusive)
+        - name: to_ledger
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+          description: Last ledger of the range (inclusive). Must be >= from_ledger.
+      responses:
+        "200":
+          description: Decode coverage for the range
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_id, from_ledger, to_ledger, total, decoded, decode_share, functions]
+                properties:
+                  contract_id:
+                    type: string
+                  from_ledger:
+                    type: integer
+                  to_ledger:
+                    type: integer
+                  total:
+                    type: integer
+                  decoded:
+                    type: integer
+                  decode_share:
+                    type: number
+                    nullable: true
+                  functions:
+                    type: array
+                    items:
+                      type: object
+                      required: [function, total, decoded, decode_share]
+                      properties:
+                        function:
+                          type: string
+                        total:
+                          type: integer
+                        decoded:
+                          type: integer
+                        decode_share:
+                          type: number
+                          nullable: true
+              example:
+                contract_id: CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+                from_ledger: 1000
+                to_ledger: 2000
+                total: 7
+                decoded: 6
+                decode_share: 0.8571
+                functions:
+                  - function: transfer
+                    total: 3
+                    decoded: 2
+                    decode_share: 0.6667
+                  - function: mint
+                    total: 4
+                    decoded: 4
+                    decode_share: 1
+        "400":
+          description: from_ledger or to_ledger is missing, not a positive integer, or from_ledger > to_ledger
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/contracts/{id}/metadata-corrections:
+    get:
+      summary: Public metadata correction history (Issue #1059)
+      description: |
+        Lists corrections made to a contract's live name or description, newest
+        first. Each entry records the previous value, the new value, the reason and
+        the API key that made the change. Prior contract_versions snapshots are
+        never rewritten.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Contract ID
+      responses:
+        "200":
+          description: Corrections for the contract (empty array when none)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_id, corrections]
+                properties:
+                  contract_id:
+                    type: string
+                  corrections:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MetadataCorrection"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    post:
+      summary: Correct a contract's name or description (Issue #1059)
+      description: |
+        Updates the live field and appends a correction record in one atomic
+        statement. The actor is taken from the authenticated API key and cannot be
+        supplied in the body.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Contract ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [field, new_value, reason]
+              properties:
+                field:
+                  type: string
+                  enum: [name, description]
+                new_value:
+                  type: string
+                  description: Max 200 characters for name, 2000 for description
+                reason:
+                  type: string
+                  maxLength: 500
+            example:
+              field: name
+              new_value: Soroban Token
+              reason: Corrects a typo in the registered name
+      responses:
+        "201":
+          description: Correction recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataCorrection"
+        "400":
+          description: Invalid field, value or reason
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Contract not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "500":
           description: Internal server error
           content:
@@ -807,6 +1425,62 @@ paths:
                 $ref: "#/components/schemas/AlertResolveResult"
         "401":
           description: Missing or invalid admin bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/contracts/bulk:
+    post:
+      summary: Bulk contract metadata lookup
+      operationId: getBulkContractMeta
+      description: |
+        Accepts a bounded list of contract IDs (up to 100) and returns per-item found or not-found metadata results.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkContractsRequest"
+      responses:
+        "200":
+          description: Bulk lookup results per contract ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkContractsResponse"
+        "400":
+          description: Invalid request payload or batch size exceeds limit (100)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: Payload exceeds 1MB size limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    get:
+      summary: Bulk contract metadata lookup via query parameter
+      operationId: getBulkContractMetaGet
+      description: Returns contract metadata for a comma-separated list of contract IDs (up to 100).
+      parameters:
+        - name: ids
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Comma-separated list of contract IDs (max 100)
+      responses:
+        "200":
+          description: Bulk lookup results per contract ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkContractsResponse"
+        "400":
+          description: Invalid request or batch size exceeds limit
           content:
             application/json:
               schema:
@@ -985,6 +1659,283 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "500":
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/wallet/compare:
+    get:
+      summary: Compare activity between two public accounts
+      description: >-
+        Summarises each account's indexed events over an optional date interval
+        and lists the contracts both accounts touched. `fields_used` discloses
+        the event columns the figures were derived from. Empty accounts return
+        zeroed summaries.
+      parameters:
+        - name: a
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: "^G[A-Z2-7]{55}$"
+        - name: b
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: "^G[A-Z2-7]{55}$"
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: Side-by-side activity summary
+          content:
+            application/json:
+              example:
+                interval: { from: "2026-01-01", to: "2026-01-31" }
+                accounts:
+                  - address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                    event_count: 2
+                    contract_count: 1
+                    contract_ids: ["CABC"]
+                    function_counts: { transfer: 2 }
+                    first_ledger: 10
+                    last_ledger: 20
+                  - address: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+                    event_count: 0
+                    contract_count: 0
+                    contract_ids: []
+                    function_counts: {}
+                    first_ledger: null
+                    last_ledger: null
+                shared_contract_ids: []
+                fields_used: [contract_id, function, ledger, created_at]
+        "400":
+          description: Malformed address, identical addresses, or invalid interval
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/wallet/{address}/counterparties:
+    get:
+      summary: Most-interacted contracts and counterparties for a wallet
+      description: >-
+        Ranks the contracts and counterparty addresses (G... or C...) that a
+        public account's events reference, by event count. Each entry includes
+        tx_hashes and event_seqs (capped at 10) to drill down to source
+        transactions and events. Counterparties come from a textual scan of
+        event topics and data, so they can include referenced-only addresses.
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^G[A-Z2-7]{55}$"
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+      responses:
+        "200":
+          description: Ranked contracts and counterparties
+          content:
+            application/json:
+              example:
+                address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                interval: { from: null, to: null }
+                contracts:
+                  - contract_id: "CABC"
+                    count: 2
+                    tx_hashes: ["hashA", "hashB"]
+                    event_seqs: [7, 9]
+                counterparties:
+                  - address: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+                    count: 1
+                    tx_hashes: ["hashA"]
+                    event_seqs: [7]
+        "400":
+          description: Malformed address, invalid interval, or invalid limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/wallet/workspace:
+    post:
+      summary: Summarise a private multi-account review selection
+      description: >-
+        Returns activity and counterparty summaries for 2-10 distinct public
+        accounts in one response. The server stores nothing: the selection is
+        kept in the browser, and the response is sent with Cache-Control:
+        no-store.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [addresses]
+              properties:
+                addresses:
+                  type: array
+                  minItems: 2
+                  maxItems: 10
+                  items:
+                    type: string
+                    pattern: "^G[A-Z2-7]{55}$"
+                from:
+                  type: string
+                  format: date
+                to:
+                  type: string
+                  format: date
+      responses:
+        "200":
+          description: One summary per requested account, in request order
+          content:
+            application/json:
+              example:
+                interval: { from: null, to: null }
+                accounts:
+                  - address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                    activity:
+                      event_count: 1
+                      contract_count: 1
+                      contract_ids: ["CABC"]
+                      function_counts: { transfer: 1 }
+                      first_ledger: 10
+                      last_ledger: 10
+                    contracts:
+                      - contract_id: "CABC"
+                        count: 1
+                        tx_hashes: ["hashA"]
+                        event_seqs: [7]
+                    counterparties: []
+                fields_used: [contract_id, function, ledger, created_at]
+        "400":
+          description: Non-array body, 1 or more than 10 accounts, invalid or duplicate addresses, or invalid interval
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/wallet/filter-presets/validate:
+    post:
+      summary: Validate an account activity filter preset
+      description: >-
+        Checks a preset's name, fn categories, and date interval, and returns
+        the normalised form. Stores nothing. Presets are saved in the browser.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 60 }
+                fn: { type: string, description: "Comma-separated categories, up to 10" }
+                from: { type: string, format: date }
+                to: { type: string, format: date }
+      responses:
+        "200":
+          description: Normalised preset
+          content:
+            application/json:
+              example:
+                preset: { name: "Monthly transfers", fn: "transfer", from: "2026-01-01", to: "2026-01-31" }
+        "422":
+          description: Every validation problem, in `errors`
+          content:
+            application/json:
+              example:
+                errors: ["name is required"]
+
+  /api/wallet/filter-presets/share:
+    post:
+      summary: Encode a filter preset as a share token
+      description: >-
+        Returns a self-contained, versioned, base64url token for a validated
+        preset. The token carries the preset itself; nothing is stored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 60 }
+                fn: { type: string }
+                from: { type: string, format: date }
+                to: { type: string, format: date }
+      responses:
+        "200":
+          description: Share token
+          content:
+            application/json:
+              example:
+                token: "eyJ2IjoxLCJuYW1lIjoiVHJhbnNmZXJzIn0"
+        "422":
+          description: Invalid preset
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/wallet/filter-presets/open:
+    post:
+      summary: Decode a filter preset share token
+      description: >-
+        Decodes a share token and re-validates the preset it contains, so a
+        hand-made token cannot skip the checks applied on save.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, maxLength: 2048 }
+      responses:
+        "200":
+          description: Decoded and validated preset
+          content:
+            application/json:
+              example:
+                preset: { name: "Transfers", fn: "transfer", from: null, to: null }
+        "422":
+          description: Malformed, unsupported, or invalid token
           content:
             application/json:
               schema:
@@ -1278,6 +2229,43 @@ paths:
                   value: { calls: [], delta: null }
         "404":
           description: Event not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/events/{seq}/decode-provenance:
+    get:
+      summary: Event decode provenance
+      description: Returns decoder and ABI version identifiers plus decode status in a backward-compatible response (#1071).
+      parameters:
+        - name: seq
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 15
+      responses:
+        "200":
+          description: Decode provenance details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventDecodeProvenanceResponse"
+        "404":
+          description: Event not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Invalid event sequence number
           content:
             application/json:
               schema:
@@ -2024,6 +3012,88 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /api/tokens/{id}/concentration:
+    get:
+      summary: Holder concentration over the current balance snapshot (Issue #1061)
+      description: |
+        Returns the share of total supply held by the top N holders and the
+        Herfindahl-Hirschman index (HHI, 0..10000) computed from holder shares
+        rounded to basis points. Zero, negative and malformed balances are excluded
+        and counted in `invalid_balances`. The source is the current token_holders
+        snapshot only; no historical series is available, indicated by
+        `coverage.historical: false`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Token contract ID
+        - name: top
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 10
+          description: Number of largest holders in the top-N window
+      responses:
+        "200":
+          description: Concentration metrics (shares are null when there are no positive balances)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_id, holder_count, total_balance_raw, top, top_share, hhi, invalid_balances, coverage]
+                properties:
+                  contract_id:
+                    type: string
+                  holder_count:
+                    type: integer
+                  total_balance_raw:
+                    type: string
+                  top:
+                    type: integer
+                  top_share:
+                    type: number
+                    nullable: true
+                  hhi:
+                    type: number
+                    nullable: true
+                  invalid_balances:
+                    type: integer
+                  coverage:
+                    type: object
+                    properties:
+                      source:
+                        type: string
+                      snapshot:
+                        type: string
+                      historical:
+                        type: boolean
+              example:
+                contract_id: CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+                holder_count: 4
+                total_balance_raw: "100"
+                top: 2
+                top_share: 0.5
+                hhi: 2500
+                invalid_balances: 0
+                coverage: { source: token_holders, snapshot: current, historical: false }
+        "400":
+          description: top is not an integer between 1 and 100
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /api/tokens/{id}/holders:
     get:
       summary: Token holder list for a SEP-41 contract
@@ -2196,6 +3266,14 @@ paths:
             minimum: 1
             maximum: 365
           description: Rolling window length in days (clamped server-side to 7..365)
+        - name: as_of_ledger
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            example: 1050
+          description: Upper ledger sequence watermark to bound the analytics query
       responses:
         "200":
           description: Collection analytics
@@ -2577,6 +3655,221 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+
+  /api/sandbox/{id}/checkpoints:
+    get:
+      summary: List sandbox checkpoints and scenarios
+      description: Returns saved checkpoints and scenarios for the sandbox.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: "sandbox-abc123"
+      responses:
+        "200":
+          description: Checkpoints and scenarios list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  checkpoints:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SandboxCheckpoint"
+                  scenarios:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SandboxScenario"
+        "404":
+          description: Sandbox not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    post:
+      summary: Create a named checkpoint for sandbox
+      description: Captures current sandbox state as a named checkpoint.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: "sandbox-abc123"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  example: "checkpoint-initial"
+                description:
+                  type: string
+                  example: "Initial setup after deployment"
+      responses:
+        "201":
+          description: Checkpoint created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  checkpoint:
+                    $ref: "#/components/schemas/SandboxCheckpoint"
+        "400":
+          description: Missing or empty checkpoint name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Sandbox not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/sandbox/{id}/reset:
+    post:
+      summary: Reset sandbox environment to named checkpoint (non-destructive)
+      description: Restores files to the selected checkpoint with confirmation, retaining all saved scenarios and checkpoints.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: "sandbox-abc123"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [checkpointId, confirm]
+              properties:
+                checkpointId:
+                  type: string
+                  example: "chk_12345"
+                confirm:
+                  type: boolean
+                  example: true
+      responses:
+        "200":
+          description: Reset completed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  restoredCheckpoint:
+                    type: string
+                    example: "checkpoint-initial"
+                  retainedScenariosCount:
+                    type: integer
+                    example: 2
+                  retainedCheckpointsCount:
+                    type: integer
+                    example: 3
+        "400":
+          description: Missing checkpointId or confirmation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Sandbox or checkpoint not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/sandbox/{id}/scenarios:
+    get:
+      summary: List saved scenarios for sandbox
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: "sandbox-abc123"
+      responses:
+        "200":
+          description: List of scenarios
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scenarios:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SandboxScenario"
+    post:
+      summary: Save a named scenario for sandbox
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: "sandbox-abc123"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  example: "Token transfer scenario"
+                contractId:
+                  type: string
+                  example: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                fn:
+                  type: string
+                  example: "transfer"
+                args:
+                  type: string
+                  example: '["GABC...", 100]'
+                description:
+                  type: string
+                  example: "Standard transfer test"
+      responses:
+        "201":
+          description: Scenario saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  scenario:
+                    $ref: "#/components/schemas/SandboxScenario"
 
   /api/sandboxes:
     get:
@@ -3208,6 +4501,219 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+
+  /api/abi/lint:
+    post:
+      summary: Lint an ABI function list (Issue #1054)
+      description: |
+        Pure checks run before submission: Soroban symbol naming, duplicate
+        functions and parameters, parameter kinds, and size limits. Unknown
+        parameter kinds are returned as warnings, not errors.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [functions]
+              properties:
+                functions:
+                  type: array
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name:
+                        type: string
+                      description:
+                        type: string
+                      params:
+                        type: array
+                        items:
+                          type: object
+                          required: [name, kind]
+                          properties:
+                            name:
+                              type: string
+                            kind:
+                              type: string
+      responses:
+        "200":
+          description: ABI is valid (warnings may still be present)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AbiLintResult"
+        "422":
+          description: ABI has one or more errors
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AbiLintResult"
+
+  /api/abi/manifest:
+    post:
+      summary: Build a verified ABI import manifest (Issue #1055)
+      description: |
+        Binds lint-clean metadata to a contract ID, network and provenance. The
+        manifest carries the SHA-256 of the canonical metadata, not the metadata.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contract_id, network, provenance, functions]
+              properties:
+                contract_id:
+                  type: string
+                  example: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                network:
+                  type: string
+                  enum: [mainnet, testnet, futurenet]
+                provenance:
+                  type: object
+                  required: [source]
+                  properties:
+                    source:
+                      type: string
+                      maxLength: 64
+                    reference:
+                      type: string
+                      maxLength: 500
+                name:
+                  type: string
+                description:
+                  type: string
+                functions:
+                  type: array
+                  items:
+                    type: object
+      responses:
+        "200":
+          description: Manifest
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AbiManifest"
+        "422":
+          description: Identity, provenance or lint validation failed
+
+  /api/abi/manifest/verify:
+    post:
+      summary: Verify metadata against a manifest (Issue #1055)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [manifest, metadata]
+              properties:
+                manifest:
+                  $ref: "#/components/schemas/AbiManifest"
+                metadata:
+                  type: object
+      responses:
+        "200":
+          description: Manifest matches metadata
+        "422":
+          description: Version, identity or content hash mismatch
+
+  /api/contracts/{id}/lineage:
+    get:
+      summary: Upgrade lineage (Issue #1056)
+      description: |
+        WASM versions seen through upgrade events, with activation and
+        supersession ledgers, alongside the ABI metadata versions in force.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Lineage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  upgrade_count:
+                    type: integer
+                  wasm_versions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        wasm_hash:
+                          type: string
+                        activated_ledger:
+                          type: integer
+                          nullable: true
+                        activated_tx_hash:
+                          type: string
+                          nullable: true
+                        superseded_ledger:
+                          type: integer
+                          nullable: true
+                        is_current:
+                          type: boolean
+                        metadata_abi_version:
+                          type: integer
+                          nullable: true
+                  metadata_versions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        abi_version:
+                          type: integer
+                        min_ledger:
+                          type: integer
+                          nullable: true
+                        created_at:
+                          type: string
+                          nullable: true
+
+  /api/abi/preview:
+    post:
+      summary: Preview sample XDR decoding under a proposed ABI (Issue #1057)
+      description: |
+        Lints the proposed functions, then decodes each sample's base64 ScVal
+        arguments against the declared parameter kinds. At most 20 samples.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [functions]
+              properties:
+                functions:
+                  type: array
+                  items:
+                    type: object
+                samples:
+                  type: array
+                  maxItems: 20
+                  items:
+                    type: object
+                    required: [fn, args]
+                    properties:
+                      fn:
+                        type: string
+                      args:
+                        type: array
+                        items:
+                          type: string
+                          description: Base64-encoded ScVal XDR
+      responses:
+        "200":
+          description: All samples decode and type-check
+        "422":
+          description: Lint failure, unknown function, argument mismatch or decode failure
 
   /api/verify:
     post:
@@ -4712,6 +6218,110 @@ paths:
         "400":
           description: error_class missing
 
+  /api/admin/repair:
+    post:
+      summary: Trigger manual replay or repair action with audit trail (#1118)
+      description: Records actor, range, reason, dry-run mode, status, and completion.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [range, reason]
+              properties:
+                action:
+                  type: string
+                  default: replay
+                  enum: [replay, repair_range, redecode, reconcile]
+                  example: replay
+                actor:
+                  type: string
+                  example: admin_operator
+                range:
+                  type: object
+                  required: [from, to]
+                  properties:
+                    from:
+                      type: integer
+                      minimum: 0
+                      example: 1000
+                    to:
+                      type: integer
+                      minimum: 0
+                      example: 1050
+                reason:
+                  type: string
+                  example: "Recover ledger gap after RPC reconnect"
+                dry_run:
+                  type: boolean
+                  default: false
+                  example: true
+      responses:
+        "201":
+          description: Repair action initiated/completed and audit record created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepairAuditRecord"
+        "400":
+          description: Invalid input (missing reason or invalid range)
+        "401":
+          description: Unauthorized admin request
+        "500":
+          description: Execution failure recorded in audit trail
+
+  /api/admin/repair/audit:
+    get:
+      summary: List manual repair and replay audit trail (#1118)
+      description: Returns recorded actor, range, reason, dry-run, status, and completion timestamps.
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, running, completed, failed]
+        - name: actor
+          in: query
+          schema:
+            type: string
+        - name: dry_run
+          in: query
+          schema:
+            type: boolean
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: Paginated audit records
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RepairAuditRecord"
+                  total:
+                    type: integer
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+
   /api/admin/api-keys/{id}/signing-secret:
     post:
       summary: Issue a request-signing secret for an API key (#852)
@@ -4935,6 +6545,49 @@ components:
         Compatible with standard authenticator apps (30s step, 6 digits, SHA-1).
 
   schemas:
+    AbiFinding:
+      type: object
+      properties:
+        path:
+          type: string
+        code:
+          type: string
+        message:
+          type: string
+    AbiLintResult:
+      type: object
+      properties:
+        valid:
+          type: boolean
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/AbiFinding"
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/AbiFinding"
+    AbiManifest:
+      type: object
+      properties:
+        manifest_version:
+          type: integer
+          example: 1
+        contract_id:
+          type: string
+        network:
+          type: string
+          enum: [mainnet, testnet, futurenet]
+        provenance:
+          type: object
+          properties:
+            source:
+              type: string
+            reference:
+              type: string
+        content_hash:
+          type: string
+          description: Lowercase hex SHA-256 of the canonical metadata
     NullableNumber:
       type: number
       nullable: true
@@ -5414,6 +7067,164 @@ components:
           type: object
           description: Dependency health details (same as HealthStatus.dependencies)
 
+    PoolStatus:
+      type: object
+      required: [total, idle, active, waiting, max, saturation, avgWaitTimeMs]
+      properties:
+        total:
+          type: integer
+          example: 10
+        idle:
+          type: integer
+          example: 7
+        active:
+          type: integer
+          example: 3
+        waiting:
+          type: integer
+          example: 0
+        max:
+          type: integer
+          example: 10
+        saturation:
+          type: number
+          example: 0.3
+        avgWaitTimeMs:
+          type: number
+          example: 15
+        maxWaitTimeMs:
+          type: number
+          example: 45
+
+    LatencyDistributionBucket:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 120
+        avgMs:
+          type: number
+          nullable: true
+          example: 14.5
+        p50Ms:
+          type: number
+          nullable: true
+          example: 12.0
+        p90Ms:
+          type: number
+          nullable: true
+          example: 25.0
+        p99Ms:
+          type: number
+          nullable: true
+          example: 48.0
+        minMs:
+          type: number
+          nullable: true
+          example: 2.1
+        maxMs:
+          type: number
+          nullable: true
+          example: 65.0
+
+    LatencyFamilyStats:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 120
+        server:
+          $ref: "#/components/schemas/LatencyDistributionBucket"
+        upstream:
+          $ref: "#/components/schemas/LatencyDistributionBucket"
+        total:
+          $ref: "#/components/schemas/LatencyDistributionBucket"
+
+    LatencyDistributionsResponse:
+      type: object
+      required: [timestamp]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        route_family:
+          type: string
+          example: "events"
+        route_families:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/LatencyFamilyStats"
+
+    OperatorIncidentEvent:
+      type: object
+      required: [id, event_type, severity, source, summary, created_at]
+      properties:
+        id:
+          type: integer
+          example: 1
+        event_type:
+          type: string
+          enum: [deployment, provider_change, lag_spike, recovery_action, alert_trigger, alert_resolve]
+          example: "provider_change"
+        severity:
+          type: string
+          enum: [info, warning, critical]
+          example: "warning"
+        source:
+          type: string
+          example: "rpc"
+        summary:
+          type: string
+          example: "RPC node failed over to backup provider"
+        details:
+          type: object
+        created_at:
+          type: string
+          format: date-time
+          example: "2024-01-15T10:30:00.000Z"
+
+    OperatorIncidentTimelineResponse:
+      type: object
+      required: [data, total, limit, offset]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/OperatorIncidentEvent"
+        total:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 50
+        offset:
+          type: integer
+          example: 0
+
+    OperatorIncidentCreateRequest:
+      type: object
+      required: [event_type, summary]
+      properties:
+        event_type:
+          type: string
+          enum: [deployment, provider_change, lag_spike, recovery_action, alert_trigger, alert_resolve]
+          example: "deployment"
+        severity:
+          type: string
+          enum: [info, warning, critical]
+          default: "info"
+          example: "info"
+        source:
+          type: string
+          default: "indexer"
+          example: "indexer"
+        summary:
+          type: string
+          example: "Deployed indexer v1.4.0"
+        details:
+          type: object
+          example: { "version": "v1.4.0" }
+
     ErrorResponse:
       type: object
       required: [error]
@@ -5662,6 +7473,16 @@ components:
           type: string
         days:
           type: integer
+        as_of_ledger:
+          type: integer
+          nullable: true
+          example: 1050
+          description: Upper ledger sequence watermark requested to bound the query
+        watermark:
+          type: integer
+          nullable: true
+          example: 1048
+          description: Actual highest indexed ledger watermark present in the returned dataset
         totals:
           type: object
           required: [minted, transfers, unique_holders]
@@ -5773,6 +7594,52 @@ components:
           type: string
           format: date-time
 
+    SandboxCheckpoint:
+      type: object
+      required: [id, name, createdAt, files]
+      properties:
+        id:
+          type: string
+          example: "chk_1697630000_abc"
+        name:
+          type: string
+          example: "Initial deployment"
+        description:
+          type: string
+          example: "Deployed contracts and initial storage"
+        createdAt:
+          type: string
+          format: date-time
+        files:
+          type: object
+          additionalProperties: true
+
+    SandboxScenario:
+      type: object
+      required: [id, name, createdAt]
+      properties:
+        id:
+          type: string
+          example: "scen_1697630000_xyz"
+        name:
+          type: string
+          example: "Token transfer test"
+        contractId:
+          type: string
+          example: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+        fn:
+          type: string
+          example: "transfer"
+        args:
+          type: string
+          example: '["GABC...", 100]'
+        description:
+          type: string
+          example: "Transfer 100 tokens to Alice"
+        createdAt:
+          type: string
+          format: date-time
+
     SandboxSimulateResult:
       type: object
       required: [success]
@@ -5793,6 +7660,18 @@ components:
         minResourceFee:
           type: string
           nullable: true
+        ledgerIO:
+          type: object
+          nullable: true
+          properties:
+            readBytes:
+              type: integer
+            writeBytes:
+              type: integer
+            readEntries:
+              type: integer
+            writeEntries:
+              type: integer
         latestLedger:
           type: integer
           nullable: true
@@ -6043,13 +7922,47 @@ components:
             swap events where min_amount_out is known.
         decode_status:
           type: string
-          enum: [verified, unverified, heuristic]
           description: Trust level assigned by ABI shape validation.
+          example: "verified"
         decode_warnings:
           type: array
           items:
             type: string
           description: Machine-readable reasons the ABI validation gate did not pass.
+        decoder:
+          type: string
+          nullable: true
+          example: "native-sac"
+          description: Identifier of the decoder that processed the event
+        decoder_version:
+          type: string
+          nullable: true
+          example: "1.0.0"
+          description: Version of the decoder that processed the event
+        abi_version:
+          type: integer
+          nullable: true
+          example: 0
+          description: ABI version identifier used during decode
+        decode_provenance:
+          type: object
+          description: Detailed decoder and ABI provenance information
+          properties:
+            decoder:
+              type: string
+              nullable: true
+              example: "native-sac"
+            decoder_version:
+              type: string
+              nullable: true
+              example: "1.0.0"
+            abi_version:
+              type: integer
+              nullable: true
+              example: 0
+            decode_status:
+              type: string
+              example: "verified"
 
     KeysetPageInfo:
       type: object
@@ -6090,6 +8003,22 @@ components:
         count_is_estimate:
           type: boolean
           description: True when total count is approximate (reltuples/planner)
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartialDataWarning"
+          description: Structured warnings when data is incomplete
+
+    PartialDataWarning:
+      type: object
+      required: [code, message]
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          enum: [indexer_lag, metadata_unavailable, provider_unavailable]
+        message:
+          type: string
 
     SearchResponse:
       type: object
@@ -6227,7 +8156,49 @@ components:
           type: object
           nullable: true
           example: null
+        lookalike_warning:
+          type: object
+          nullable: true
+          description: Phishing-risk context if the contract name resembles a verified brand (Issue #1121)
+          properties:
+            is_lookalike:
+              type: boolean
+            resembles:
+              type: string
+            authoritative_contract_id:
+              type: string
+            warning:
+              type: string
+            risk_level:
+              type: string
+              enum: [high, medium, low]
+            similarity_reason:
+              type: string
 
+    MetadataCorrection:
+      type: object
+      required: [id, contract_id, field, new_value, reason, actor, created_at]
+      properties:
+        id:
+          type: integer
+        contract_id:
+          type: string
+        field:
+          type: string
+          enum: [name, description]
+        old_value:
+          type: string
+          nullable: true
+        new_value:
+          type: string
+        reason:
+          type: string
+        actor:
+          type: string
+          description: API key id that made the correction
+        created_at:
+          type: string
+          format: date-time
     AbiHistoryEntry:
       type: object
       required: [abi_version, functions, registered_by, min_ledger, created_at]
@@ -6354,6 +8325,16 @@ components:
           type: integer
           description: The number of trailing days requested via the range query parameter
           example: 90
+        as_of_ledger:
+          type: integer
+          nullable: true
+          description: Upper ledger sequence watermark requested to bound the query
+          example: 1050000
+        watermark:
+          type: integer
+          nullable: true
+          description: Actual latest indexed ledger watermark included in the dataset
+          example: 1050320
         events_per_day:
           type: array
           items:
@@ -6405,6 +8386,158 @@ components:
           type: string
           nullable: true
           example: "centre.io"
+
+    EventDecodeProvenanceResponse:
+      type: object
+      required: [seq, decode_provenance]
+      properties:
+        seq:
+          type: integer
+          example: 15
+        event_id:
+          type: string
+          nullable: true
+          example: "0000000001050-0000000015"
+        contract_id:
+          type: string
+          nullable: true
+          example: "CC4VM2DTTR4QO4J4E5K2YUXM"
+        decoder:
+          type: string
+          nullable: true
+          example: "native-sac"
+        decoder_version:
+          type: string
+          nullable: true
+          example: "1.0.0"
+        abi_version:
+          type: integer
+          nullable: true
+          example: 0
+        decode_status:
+          type: string
+          example: "verified"
+        decode_provenance:
+          type: object
+          properties:
+            decoder:
+              type: string
+              nullable: true
+            decoder_version:
+              type: string
+              nullable: true
+            abi_version:
+              type: integer
+              nullable: true
+            decode_status:
+              type: string
+
+    TransactionEventsResponse:
+      type: object
+      required: [tx_hash, events, total, limit, offset]
+      properties:
+        tx_hash:
+          type: string
+          example: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/DecodedEvent"
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/DecodedEvent"
+        total:
+          type: integer
+          example: 3
+        limit:
+          type: integer
+          example: 50
+        offset:
+          type: integer
+          example: 0
+
+    ContractActivitySummaryResponse:
+      type: object
+      required: [contract_id, interval, range, total_events, by_function, intervals, partial_data, partial_indicators]
+      properties:
+        contract_id:
+          type: string
+          example: "CC4VM2DTTR4QO4J4E5K2YUXM"
+        interval:
+          type: string
+          enum: [hour, day, week]
+          example: "day"
+        range:
+          type: integer
+          example: 30
+        as_of_ledger:
+          type: integer
+          nullable: true
+          example: 1050000
+        watermark:
+          type: integer
+          nullable: true
+          example: 1050320
+        total_events:
+          type: integer
+          example: 250
+        by_function:
+          type: array
+          items:
+            type: object
+            required: [function, count]
+            properties:
+              function:
+                type: string
+                example: "transfer"
+              count:
+                type: integer
+                example: 180
+        intervals:
+          type: array
+          items:
+            type: object
+            required: [start, end, count, functions, is_partial]
+            properties:
+              start:
+                type: string
+                format: date-time
+                example: "2026-10-01T00:00:00.000Z"
+              end:
+                type: string
+                format: date-time
+                example: "2026-10-02T00:00:00.000Z"
+              count:
+                type: integer
+                example: 15
+              functions:
+                type: object
+                additionalProperties:
+                  type: integer
+                example: { "transfer": 10, "mint": 5 }
+              is_partial:
+                type: boolean
+                example: false
+        partial_data:
+          type: boolean
+          example: false
+        partial_indicators:
+          type: object
+          required: [as_of_ledger_bounded, incomplete_history, active_interval_incomplete, truncated_functions]
+          properties:
+            as_of_ledger_bounded:
+              type: boolean
+              example: false
+            incomplete_history:
+              type: boolean
+              example: false
+            active_interval_incomplete:
+              type: boolean
+              example: true
+            truncated_functions:
+              type: boolean
+              example: false
 
   headers:
     X-RateLimit-Limit:

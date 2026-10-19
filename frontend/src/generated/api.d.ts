@@ -196,6 +196,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Capability-discovery endpoint
+         * @description Exposes supported networks, API versions, pagination modes, transports, and feature flags in a cacheable response.
+         */
+        get: operations["getCapabilities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/alerts": {
         parameters: {
             query?: never;
@@ -536,6 +556,30 @@ export interface paths {
         };
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sql": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Execute curated analytics SQL query via GET
+         * @description Executes a read-only query against curated analytics views. Supports conditional requests via ETag and X-Ledger-Watermark headers.
+         */
+        get: operations["executeSqlAnalyticsGet"];
+        put?: never;
+        /**
+         * Execute curated analytics SQL query
+         * @description Executes a read-only query against curated analytics views. Supports conditional requests via ETag and X-Ledger-Watermark headers.
+         */
+        post: operations["executeSqlAnalyticsPost"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1131,6 +1175,30 @@ export interface paths {
                 };
             };
         };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/contracts/bulk": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Bulk contract metadata lookup via query parameter
+         * @description Returns contract metadata for a comma-separated list of contract IDs (up to 100).
+         */
+        get: operations["getBulkContractMetaGet"];
+        put?: never;
+        /**
+         * Bulk contract metadata lookup
+         * @description Accepts a bounded list of contract IDs (up to 100) and returns per-item found or not-found metadata results.
+         */
+        post: operations["getBulkContractMeta"];
         delete?: never;
         options?: never;
         head?: never;
@@ -6439,6 +6507,98 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        ApiCapabilities: {
+            /**
+             * @example [
+             *       "testnet",
+             *       "mainnet",
+             *       "futurenet"
+             *     ]
+             */
+            networks: string[];
+            /** @example testnet */
+            current_network: string;
+            /**
+             * @example [
+             *       "v1"
+             *     ]
+             */
+            api_versions: string[];
+            /** @example v1 */
+            current_version: string;
+            /**
+             * @example [
+             *       "cursor",
+             *       "offset"
+             *     ]
+             */
+            pagination_modes: string[];
+            /**
+             * @example [
+             *       "http",
+             *       "websocket",
+             *       "sse",
+             *       "graphql"
+             *     ]
+             */
+            transports: string[];
+            /**
+             * @example {
+             *       "graphql": true,
+             *       "websockets": true,
+             *       "sse": true,
+             *       "sandbox": true,
+             *       "webhooks": true,
+             *       "contract_verification": true,
+             *       "dlq": true,
+             *       "rate_limiting": true,
+             *       "analytics_sql": true
+             *     }
+             */
+            feature_flags: {
+                [key: string]: boolean;
+            };
+            features?: {
+                [key: string]: boolean;
+            };
+        };
+        BulkContractsRequest: {
+            /**
+             * @description List of contract IDs to fetch metadata for (1-100 items).
+             * @example [
+             *       "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+             *       "CBBIJZZ6ZAZ7XU7I4MUPG22I2V6K4L5DY36F5W5W5W5W5W5W5W5W5W5W"
+             *     ]
+             */
+            contract_ids: string[];
+        };
+        BulkContractItem: {
+            contract_id: string;
+            id?: string;
+            found: boolean;
+            metadata?: Record<string, never> | null;
+            data?: Record<string, never> | null;
+            error?: string | null;
+        };
+        BulkContractsResponse: {
+            results: components["schemas"]["BulkContractItem"][];
+            data?: components["schemas"]["BulkContractItem"][];
+            total: number;
+            found: number;
+            not_found: number;
+        };
+        SqlAnalyticsRequest: {
+            /**
+             * @description Read-only SQL query reading from analytics views.
+             * @example SELECT count(*) FROM analytics.events
+             */
+            query: string;
+            /**
+             * @default json
+             * @enum {string}
+             */
+            format: "json" | "csv";
+        };
         NullableNumber: number | null;
         NetworkLedgerMetric: {
             ledger: number;
@@ -7361,4 +7521,250 @@ export interface components {
     pathItems: never;
 }
 export type $defs = Record<string, never>;
-export type operations = Record<string, never>;
+export interface operations {
+    getCapabilities: {
+        parameters: {
+            query?: {
+                /** @description Optional network name to filter capabilities for */
+                network?: "testnet" | "mainnet" | "futurenet";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description API capabilities summary */
+            200: {
+                headers: {
+                    /** @description Entity tag for conditional validation. */
+                    ETag?: string;
+                    /** @description Caching directives. */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiCapabilities"];
+                };
+            };
+            /** @description Capabilities have not changed since previous request. */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid or unsupported network query parameter */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    executeSqlAnalyticsGet: {
+        parameters: {
+            query: {
+                /** @description Analytics SQL query to execute */
+                query: string;
+                /** @description Response format */
+                format?: "json" | "csv";
+            };
+            header?: {
+                /** @description Entity tag validator for conditional requests */
+                "If-None-Match"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Analytics query results */
+            200: {
+                headers: {
+                    /** @description Entity tag based on query and ledger watermark */
+                    ETag?: string;
+                    /** @description Current indexed ledger watermark */
+                    "X-Ledger-Watermark"?: string;
+                    /** @description Cache control directives */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                    "text/csv": string;
+                };
+            };
+            /** @description Results unchanged for current query and ledger watermark */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid query or disallowed SQL constructs */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Analytics database not configured */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    executeSqlAnalyticsPost: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tag validator for conditional requests */
+                "If-None-Match"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SqlAnalyticsRequest"];
+            };
+        };
+        responses: {
+            /** @description Analytics query results */
+            200: {
+                headers: {
+                    /** @description Entity tag based on query and ledger watermark */
+                    ETag?: string;
+                    /** @description Current indexed ledger watermark */
+                    "X-Ledger-Watermark"?: string;
+                    /** @description Cache control directives */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                    "text/csv": string;
+                };
+            };
+            /** @description Results unchanged for current query and ledger watermark */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid query or disallowed SQL constructs */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Request payload exceeds size limit (1MB) */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Analytics database not configured */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getBulkContractMetaGet: {
+        parameters: {
+            query?: {
+                /** @description Comma-separated list of contract IDs (max 100) */
+                ids?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bulk lookup results per contract ID */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkContractsResponse"];
+                };
+            };
+            /** @description Invalid request or batch size exceeds limit */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getBulkContractMeta: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkContractsRequest"];
+            };
+        };
+        responses: {
+            /** @description Bulk lookup results per contract ID */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkContractsResponse"];
+                };
+            };
+            /** @description Invalid request payload or batch size exceeds limit (100) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Payload exceeds 1MB size limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+}

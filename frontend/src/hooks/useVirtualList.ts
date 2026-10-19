@@ -24,6 +24,7 @@ const OVERSCAN = 5;
 export function useVirtualList<T>(
   items: T[],
   containerRef: React.RefObject<HTMLElement | null>,
+  rowHeight: number = ROW_HEIGHT,
 ) {
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
@@ -62,12 +63,12 @@ export function useVirtualList<T>(
   }, [containerRef]);
 
   // ---------- derived values ----------
-  const totalHeight = items.length * ROW_HEIGHT;
+  const totalHeight = items.length * rowHeight;
 
-  const startIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
+  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - OVERSCAN);
   const endIndex = Math.min(
     items.length,
-    Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + OVERSCAN,
+    Math.ceil((scrollTop + viewportHeight) / rowHeight) + OVERSCAN,
   );
 
   const visibleItems = items.slice(startIndex, endIndex).map((item, i) => ({
@@ -75,9 +76,9 @@ export function useVirtualList<T>(
     index: startIndex + i,
     style: {
       position: "absolute" as const,
-      top: (startIndex + i) * ROW_HEIGHT,
+      top: (startIndex + i) * rowHeight,
       width: "100%",
-      height: ROW_HEIGHT,
+      height: rowHeight,
     },
   }));
 

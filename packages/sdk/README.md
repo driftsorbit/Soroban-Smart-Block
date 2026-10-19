@@ -86,6 +86,132 @@ const {
 } = response.meta;
 ```
 
+### Configurable Retry & Backoff Policies (#1082)
+
+The client automatically retries transient errors on safe/idempotent reads (GET/HEAD), honors `Retry-After` headers, and prevents replaying non-idempotent writes (POST/PATCH/DELETE):
+
+```typescript
+import { createClient } from '@soroban-explorer/sdk';
+
+const client = createClient({
+  baseUrl: 'https://api.soroban-explorer.com',
+  retry: {
+    maxRetries: 3,            // Maximum retry attempts
+    initialDelayMs: 500,      // Exponential backoff start
+    maxDelayMs: 10000,        // Backoff ceiling
+    backoffFactor: 2,         // Multiplier
+    jitter: true,             // Add randomized jitter
+    onRetry: (ctx) => console.log(`Retry attempt ${ctx.attempt} after ${ctx.delayMs}ms`),
+  },
+});
+
+// Per-request retry override
+const events = await client.get('/api/events', { retry: { maxRetries: 5 } });
+
+// Non-idempotent writes are never retried unless explicitly flagged:
+await client.post('/api/jobs', { type: 'export' }, { idempotent: true });
+```
+
+### Request Cancellation & Timeouts (#1083)
+
+Cancel requests using standard `AbortSignal` or configure per-request timeouts:
+
+```typescript
+import { createClient, TimeoutError } from '@soroban-explorer/sdk';
+
+const client = createClient({ timeout: 10000 }); // Default 10s
+
+// Explicit cancellation via AbortController
+const controller = new AbortController();
+setTimeout(() => controller.abort('User cancelled navigation'), 1000);
+
+try {
+  await client.get('/api/events', { signal: controller.signal });
+} catch (err) {
+  console.log('Cancelled:', err);
+}
+
+// Per-request timeout override
+try {
+  await client.get('/api/events', { timeout: 2000 }); // 2-second timeout
+} catch (err) {
+  if (err instanceof TimeoutError) {
+    console.error(`Timed out after ${err.timeoutMs}ms`);
+  }
+}
+```
+
+### Webhook Signature Verification (#1084)
+
+Verify incoming webhook deliveries with raw request bytes, timestamp tolerance, and replay protection:
+
+```typescript
+import {
+  verifyWebhookSignature,
+  assertWebhookSignature,
+  createReplayCache,
+} from '@soroban-explorer/sdk';
+
+const replayCache = createReplayCache(); // In-memory cache preventing duplicate delivery replays
+
+// In your Express or HTTP handler:
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const result = await verifyWebhookSignature({
+    secret: process.env.WEBHOOK_SECRET!,
+    rawBody: req.body, // Must be raw bytes or string
+    headers: req.headers, // Extracts X-Webhook-Signature and X-Webhook-Timestamp
+    tolerance: 300, // 5-minute timestamp tolerance
+    replayCache,
+  });
+
+  if (!result.valid) {
+    return res.status(401).json({ error: result.error, message: result.message });
+  }
+
+  const event = result.payload;
+  console.log(`Verified webhook event for contract ${event.contract_id}`);
+  res.status(200).json({ received: true });
+});
+```
+
+### ABI Event Decoding & Type Helpers (#1085)
+
+Decode Soroban contract events using registered ABI metadata while preserving raw XDR and unknown fields:
+
+```typescript
+import {
+  createEventDecoder,
+  decodeEventWithAbi,
+  generateEventTypes,
+} from '@soroban-explorer/sdk';
+
+const tokenAbi = {
+  name: 'ExampleToken',
+  functions: [
+    {
+      name: 'transfer',
+      params: [
+        { name: 'from', kind: 'Address' },
+        { name: 'to', kind: 'Address' },
+        { name: 'amount', kind: 'i128' },
+      ],
+    },
+  ],
+};
+
+// Reusable decoder instance
+const decoder = createEventDecoder(tokenAbi);
+const decoded = decoder.decode(rawEvent);
+
+console.log(decoded.args.from);   // Typed parameter
+console.log(decoded.args.to);     // Typed parameter
+console.log(decoded.raw_xdr);     // Raw XDR is preserved!
+console.log(decoded.custom_meta); // Unknown / future fields are preserved!
+
+// Generate TypeScript definitions from ABI metadata:
+const tsInterfaces = generateEventTypes(tokenAbi);
+```
+
 ## Development
 
 ### Generate TypeScript Types

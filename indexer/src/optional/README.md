@@ -4,11 +4,8 @@ These modules are optional or experimental features that require additional infr
 
 | File | What it does | Requires |
 |---|---|---|
-| `kafkaEventBus.js` | Redis-backed event bus with Kafka-like at-least-once delivery and 7-day retention | `REDIS_URL` env var; swap to `kafkajs` for true Kafka |
 | `leaderElection.js` | Redis distributed leader election for multi-instance deployments; already wired into the daemon | Set the same `REDIS_URL` and `LEADER_ELECTION_KEY` on every replica |
 | `rpcProviderPool.js` | Weighted RPC provider pool with sliding-window health scoring and automatic failover | Multiple `SOROBAN_RPC_URLS` configured |
-| `rpcPool.js` | Simpler round-robin RPC pool (axios-based, CommonJS) | `axios` package |
-| `eventInserter.js` | Batch event inserter with per-event error tracking (CommonJS, simplified schema) | None — but targets an older schema subset |
 
 ## How to enable
 

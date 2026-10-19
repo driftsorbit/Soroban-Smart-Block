@@ -6,6 +6,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, type NetworkLedgerMetric, type NetworkMetricsResponse } from "../api";
 import NetworkMetricChart from "../components/dashboard/NetworkMetricChart";
+import LedgerRangeComparison from "../components/LedgerRangeComparison";
 
 type Range = NetworkMetricsResponse["range"];
 // 1 h of ledgers at ~5 s cadence.
@@ -125,6 +126,8 @@ export default function NetworkDashboard() {
         <NetworkMetricChart label="Write bytes utilization" values={series.write} format={pct} />
         <NetworkMetricChart label="Tx count utilization" values={series.txUtil} format={pct} />
       </div>
+
+      <LedgerRangeComparison />
     </div>
   );
 }

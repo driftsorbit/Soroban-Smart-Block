@@ -120,7 +120,7 @@ export default function AuditLogPage() {
   useEffect(() => {
     if (!adminToken) return;
     fetchLog(0);
-  }, [adminToken]);
+  }, [adminToken, fetchLog]);
 
   const exportLog = (format: "csv" | "json") => {
     const url = `/api/admin/audit-log/export${buildQuery(filters, { format })}`;

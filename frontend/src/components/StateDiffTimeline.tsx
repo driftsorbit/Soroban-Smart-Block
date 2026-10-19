@@ -29,7 +29,7 @@ export default function StateDiffTimeline({ contractId }: Props) {
     queryFn: () => api.stateDiffs(contractId),
     enabled: !!contractId,
   });
-  const diffs = Array.isArray(diffResponse) ? diffResponse : [];
+  const diffs = useMemo(() => (Array.isArray(diffResponse) ? diffResponse : []), [diffResponse]);
 
   // Group diffs by ledger, sorted ascending
   const ledgerGroups = useMemo(() => {

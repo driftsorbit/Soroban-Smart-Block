@@ -61,6 +61,21 @@ export const dbPoolWaiting = new Gauge({
   registers: [registry],
 });
 
+/** Current DB pool saturation ratio [0, 1]. */
+export const dbPoolSaturation = new Gauge({
+  name: "soroban_db_pool_saturation_ratio",
+  help: "Database connection pool saturation ratio between 0 and 1",
+  registers: [registry],
+});
+
+/** Histogram of connection acquisition wait times in milliseconds. */
+export const dbPoolWaitDuration = new Histogram({
+  name: "soroban_db_pool_wait_duration_ms",
+  help: "Database connection pool acquisition wait time in milliseconds",
+  buckets: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
+  registers: [registry],
+});
+
 /** Decoder schema violations (validation failures before DB insert). */
 export const decoderSchemaViolationsTotal = new Counter({
   name: "soroban_decoder_schema_violations_total",
@@ -143,16 +158,37 @@ export const apiRequestDuration = new Histogram({
   registers: [registry],
 });
 
+/**
+ * Issue #1117 — Low-cardinality route-family latency histogram distinguishing
+ * server processing latency from upstream (RPC/external) latency.
+ */
+export const apiRouteFamilyDuration = new Histogram({
+  name: "api_route_family_duration_seconds",
+  help: "API request duration in seconds broken down by route family and type (server, upstream, total)",
+  labelNames: ["route_family", "method", "status", "type"],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [registry],
+});
+
 export const replicaLagMs = new Gauge({ name: "soroban_replica_lag_ms", help: "Read replica replay lag in milliseconds", labelNames: ["replica"], registers: [registry] });
 export const replicaHealthy = new Gauge({ name: "soroban_replica_healthy", help: "Whether a read replica is eligible for routing", labelNames: ["replica"], registers: [registry] });
 
 /**
- * Update DB pool gauges from a pg.Pool instance.
+ * Update DB pool gauges from a pg.Pool instance or pool stats.
  * Call this periodically (e.g. every 15 s).
  * @param {import('pg').Pool} pool
+ * @param {object} [stats]
  */
-export function updateDbPoolMetrics(pool) {
-  dbPoolTotal.set(pool.totalCount);
-  dbPoolIdle.set(pool.idleCount);
-  dbPoolWaiting.set(pool.waitingCount);
+export function updateDbPoolMetrics(pool, stats = null) {
+  if (pool) {
+    dbPoolTotal.set(pool.totalCount || 0);
+    dbPoolIdle.set(pool.idleCount || 0);
+    dbPoolWaiting.set(pool.waitingCount || 0);
+  }
+  if (stats?.saturation !== undefined) {
+    dbPoolSaturation.set(Number(stats.saturation) || 0);
+  } else if (pool && pool.options?.max) {
+    const active = Math.max(0, (pool.totalCount || 0) - (pool.idleCount || 0));
+    dbPoolSaturation.set(active / pool.options.max);
+  }
 }

@@ -356,4 +356,133 @@ describe("SorobanExplorerClient", () => {
       assert.ok(call.arguments[0].endsWith("/api/wallet/GABC123/balances"));
     });
   });
+
+  // ── Timeouts and cancellation (#1083) ─────────────────────────────────────────
+
+  describe("timeouts and cancellation (#1083)", () => {
+    it("respects abort signal cancellation", async () => {
+      const controller = new AbortController();
+      controller.abort("explicit abort");
+
+      const f = mockFetch(200, {});
+      const client = new SorobanExplorerClient({
+        baseUrl: "https://api.example.com",
+        fetch: f,
+      });
+
+      await assert.rejects(
+        () => (client as any).request("/api/events", { signal: controller.signal }),
+        (err: any) => err === "explicit abort" || String(err).includes("aborted"),
+      );
+    });
+
+    it("respects request timeout option", async () => {
+      const f = (_url: string, init?: RequestInit) =>
+        new Promise((_, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new Error("Request timeout"));
+          });
+        }) as any;
+
+      const client = new SorobanExplorerClient({
+        baseUrl: "https://api.example.com",
+        timeout: 20,
+        fetch: f,
+      });
+
+      await assert.rejects(
+        () => (client as any).request("/api/events"),
+        /Request timeout/,
+      );
+    });
+  });
+
+  // ── Retry and backoff policies (#1082) ────────────────────────────────────────
+
+  describe("retry and backoff policies (#1082)", () => {
+    it("retries retryable read on 503 and succeeds", async () => {
+      let attempts = 0;
+      const f = mock.fn(async () => {
+        attempts++;
+        if (attempts === 1) {
+          return {
+            ok: false,
+            status: 503,
+            statusText: "Service Unavailable",
+            headers: { get: () => null },
+            json: async () => ({ error: "Unavailable" }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          headers: { get: () => null },
+          json: async () => ({ data: [] }),
+        };
+      }) as any;
+
+      const client = new SorobanExplorerClient({
+        baseUrl: "https://api.example.com",
+        fetch: f,
+        retry: { maxRetries: 2, initialDelayMs: 10, jitter: false },
+      });
+
+      const res = await (client as any).request("/api/events");
+      assert.deepEqual(res, { data: [] });
+      assert.equal(attempts, 2);
+    });
+
+    it("bounds retries to maxRetries on persistent 500 error", async () => {
+      let attempts = 0;
+      const f = mock.fn(async () => {
+        attempts++;
+        return {
+          ok: false,
+          status: 500,
+          statusText: "Internal Error",
+          headers: { get: () => null },
+          json: async () => ({ error: "Internal Error" }),
+        };
+      }) as any;
+
+      const client = new SorobanExplorerClient({
+        baseUrl: "https://api.example.com",
+        fetch: f,
+        retry: { maxRetries: 2, initialDelayMs: 10, jitter: false },
+      });
+
+      await assert.rejects(
+        () => (client as any).request("/api/events"),
+        (err: any) => err instanceof SorobanExplorerError && err.status === 500,
+      );
+      assert.equal(attempts, 3);
+    });
+
+    it("NEVER retries non-idempotent writes (POST)", async () => {
+      let attempts = 0;
+      const f = mock.fn(async () => {
+        attempts++;
+        return {
+          ok: false,
+          status: 500,
+          statusText: "Internal Error",
+          headers: { get: () => null },
+          json: async () => ({ error: "Internal Error" }),
+        };
+      }) as any;
+
+      const client = new SorobanExplorerClient({
+        baseUrl: "https://api.example.com",
+        fetch: f,
+        retry: { maxRetries: 3, initialDelayMs: 10 },
+      });
+
+      await assert.rejects(
+        () => (client as any).request("/api/jobs", { method: "POST", body: "{}" }),
+        (err: any) => err instanceof SorobanExplorerError && err.status === 500,
+      );
+      assert.equal(attempts, 1);
+    });
+  });
 });

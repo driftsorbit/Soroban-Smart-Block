@@ -7,8 +7,13 @@ import EventTable from "../components/EventTable";
 import ExportButton from "../components/ExportButton";
 import WalletBalances from "../components/WalletBalances";
 import SmartWalletPanel from "../components/SmartWalletPanel";
+import TokenFlowPanel from "../components/TokenFlowPanel";
+import AddressLabelEditor from "../components/AddressLabelEditor";
+import PortfolioSnapshots from "../components/PortfolioSnapshots";
 import ProtocolBadge from "../components/ProtocolBadge";
+import ActivityCalendar from "../components/ActivityCalendar";
 import { useWatchlist } from "./WatchlistPage";
+import { groupByInteraction } from "../utils/interactionGroups";
 import {
   isMuxedAddress,
   muxedId,
@@ -17,7 +22,36 @@ import {
   isValidStellarAddress,
 } from "../utils/strkey";
 
-type GroupBy = "contract" | "none";
+type GroupBy = "contract" | "interaction" | "none";
+
+/**
+ * One contract interaction: consecutive events on the same contract, shown as a
+ * single expandable item in event order (#1041).
+ */
+function InteractionList({ events }: { events: DecodedEvent[] }) {
+  const groups = useMemo(() => groupByInteraction(events), [events]);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {groups.map((group) => (
+        <details
+          key={`${group.startIndex}-${group.contractId}`}
+          style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "8px 12px" }}
+        >
+          <summary style={{ cursor: "pointer", display: "flex", gap: 10, flexWrap: "wrap", alignItems: "baseline" }}>
+            <span style={{ fontFamily: "monospace", fontSize: 13 }}>{truncateAddress(group.contractId)}</span>
+            <span style={{ color: "var(--muted)", fontSize: 12 }}>
+              {group.events.length} event{group.events.length !== 1 ? "s" : ""}
+            </span>
+            <span style={{ color: "var(--muted)", fontSize: 12 }}>{group.functions.join(", ")}</span>
+          </summary>
+          <div style={{ marginTop: 8 }}>
+            <EventTable events={group.events} />
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
 
 const EVENT_TYPE_CHIPS: { key: string; label: string }[] = [
   { key: "transfer", label: "Transfer" },
@@ -211,8 +245,6 @@ function ProtocolUsageRow({ label, count, total }: { label: string; count: numbe
 }
 
 function PortfolioTimeline({ address, events }: { address: string; events: DecodedEvent[] }) {
-  if (!address || events.length === 0) return null;
-
   // Protocol usage breakdown: count events per contract
   const contractCounts = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -233,6 +265,9 @@ function PortfolioTimeline({ address, events }: { address: string; events: Decod
     }
     return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 8);
   }, [events]);
+
+  // Hooks above must run unconditionally, so the empty-state return comes after them (#978).
+  if (!address || events.length === 0) return null;
 
   const total = events.length;
   // Large addresses notice
@@ -303,9 +338,9 @@ export default function WalletPage() {
   const fromDate = searchParams.get("from") ?? "";
   const toDate = searchParams.get("to") ?? "";
   const fnFilter = searchParams.get("fn") ?? "";
-  const groupBy = (
-    searchParams.get("group") === "contract" ? "contract" : "none"
-  ) as GroupBy;
+  const groupParam = searchParams.get("group");
+  const groupBy: GroupBy =
+    groupParam === "contract" || groupParam === "interaction" ? groupParam : "none";
 
   // ── Update document title (#525) ─────────────────────────────────────────
   if (address) {
@@ -324,7 +359,7 @@ export default function WalletPage() {
     queryFn: () => api.walletHistory(address, { from: fromDate, to: toDate }),
     enabled: !!address && isValidAddress,
   });
-  const allEvents = walletQuery.data?.events ?? [];
+  const allEvents = useMemo(() => walletQuery.data?.events ?? [], [walletQuery.data]);
   const horizonAccount = walletQuery.data?.horizon_account ?? null;
   const xlmBalance = horizonAccount?.balances?.find((b) => b.asset_type === "native");
 
@@ -557,13 +592,12 @@ export default function WalletPage() {
           <label style={{ color: "var(--muted)", fontSize: 13 }}>Group by:</label>
           <select
             value={groupBy}
-            onChange={(e) =>
-              updateParam("group", e.target.value === "contract" ? "contract" : "")
-            }
+            onChange={(e) => updateParam("group", e.target.value === "none" ? "" : e.target.value)}
             style={{ fontSize: 13 }}
           >
             <option value="none">Flat list</option>
             <option value="contract">Contract</option>
+            <option value="interaction">Interaction sequence</option>
           </select>
         </div>
 
@@ -600,6 +634,13 @@ export default function WalletPage() {
         )}
       </div>
 
+      {/* Private browser-side label (#1043) */}
+      {isValidAddress && (
+        <div className="card">
+          <AddressLabelEditor address={address} />
+        </div>
+      )}
+
       {/* XLM balance */}
       {xlmBalance && (
         <div className="card">
@@ -616,6 +657,9 @@ export default function WalletPage() {
 
       {/* Portfolio activity timeline (#916) */}
       <PortfolioTimeline address={address} events={allEvents} />
+
+      {/* Daily activity calendar (#1040) */}
+      {allEvents.length > 0 && <ActivityCalendar events={allEvents} />}
 
       {/* Events section */}
       <div className="card">
@@ -636,6 +680,9 @@ export default function WalletPage() {
           </div>
         ) : filtered.length === 0 ? (
           <p style={{ color: "var(--muted)" }}>No events match the current filters.</p>
+        ) : groupBy === "interaction" ? (
+          /* Consecutive calls to one contract, in event order (#1041) */
+          <InteractionList events={filtered} />
         ) : groupBy === "contract" && contractGroups ? (
           /* Grouped by contract (#526) */
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>

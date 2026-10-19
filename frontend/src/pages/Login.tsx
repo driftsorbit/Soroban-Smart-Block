@@ -50,7 +50,6 @@ export default function Login() {
         setMessage(`${result.claimed_api_keys} API key(s) linked to your account.`);
       });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [linkToken, linkPurpose]);
 
   const sendLink = (purpose: "signup" | "recovery") =>

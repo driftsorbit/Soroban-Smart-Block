@@ -4,7 +4,7 @@
 // @soroban-explorer/client.
 
 export { SorobanExplorerClient } from "./client.js";
-export type { ClientOptions } from "./client.js";
+export type { ClientOptions, ClientRetryOptions, ClientRequestInit } from "./client.js";
 
 export { subscribeEvents } from "./ws.js";
 

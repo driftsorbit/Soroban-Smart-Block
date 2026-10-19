@@ -21,6 +21,7 @@ function getWebSocketImpl(): typeof WebSocket {
   try {
     // Dynamic require so bundlers don't try to resolve it in browser builds
     // eslint-disable-next-line @typescript-eslint/no-require-imports
+    // @ts-ignore
     const ws = require("ws");
     return ws.default ?? ws;
   } catch {

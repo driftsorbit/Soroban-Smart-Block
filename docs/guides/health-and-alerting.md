@@ -113,12 +113,28 @@ livenessProbe:
 ```json
 {
   "status": "ready" | "not_ready",
+  "ready": true,
   "timestamp": "2026-07-28T08:25:50.874Z",
-  "reason": "Critical dependencies unhealthy"
+  "reason": null,
+  "dependencies": {
+    "database": { "status": "healthy", "ready": true, "responseTime": 3, "connections": { "total": 10, "idle": 8, "active": 2, "waiting": 0, "saturation": 0.2, "avgWaitTimeMs": 12 } },
+    "cache": { "status": "healthy", "ready": true, "optional": false, "responseTime": 1 },
+    "rpc": { "status": "healthy", "ready": true, "responseTime": 15, "healthyNodes": 2, "totalNodes": 2 }
+  }
 }
 ```
 
-**Returns 200 if status is `healthy` or `degraded`, 503 if `unhealthy`.**
+**Returns 200 if critical dependencies are healthy, 503 if not ready.**
+
+#### Per-Dependency Readiness Probing (Issue #1119)
+
+You can probe individual dependencies separately by specifying the `dependency` parameter:
+
+- `GET /health/ready?dependency=database`
+- `GET /health/ready?dependency=cache`
+- `GET /health/ready?dependency=rpc`
+
+Returns 200 OK if the target dependency is ready, 503 Service Unavailable if unhealthy, or 400 Bad Request on invalid dependency.
 
 Use this for load balancer and service-mesh traffic routing:
 
@@ -130,6 +146,26 @@ readinessProbe:
   periodSeconds: 5
   failureThreshold: 2
 ```
+
+---
+
+## Observability & Operator Tooling
+
+### Connection-Pool Saturation Tracking (Issue #1116)
+- **Endpoint**: `GET /api/db/pool`
+- Returns connection pool utilization, saturation ratio, queued client count, and average wait duration.
+- Alert: `DB_POOL_SATURATION` fires before queries fail when saturation or wait time exceeds thresholds (`DB_POOL_SATURATION_THRESHOLD`, default 0.85; `DB_POOL_WAIT_TIME_THRESHOLD_MS`, default 1000ms).
+
+### Per-Endpoint Latency Distributions (Issue #1117)
+- **Endpoint**: `GET /api/observability/latency`
+- Query param: `?route_family=events` (or `contracts`, `tokens`, `transactions`, `wallets`, `rpc`, `health`, `system`, `admin`, `webhooks`, `other`)
+- Distinguishes internal server execution latency from upstream Soroban RPC wait duration.
+- Reports `count`, `avgMs`, `p50Ms`, `p90Ms`, `p99Ms`, `minMs`, `maxMs`.
+
+### Operator Incident Timeline (Issue #1115)
+- **Endpoint**: `GET /api/operator/incidents`
+- Filter by `event_type` (`deployment`, `provider_change`, `lag_spike`, `recovery_action`, `alert_trigger`, `alert_resolve`), `severity` (`info`, `warning`, `critical`), `from`, `to`, `limit`, `offset`.
+- **Record incident**: `POST /api/operator/incidents` with `{ event_type, severity, summary, details }`.
 
 ---
 

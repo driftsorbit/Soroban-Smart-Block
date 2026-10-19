@@ -135,6 +135,55 @@ export async function deleteSandbox(sandboxId: string): Promise<void> {
 const NETWORK_PASSPHRASE = import.meta.env.VITE_STELLAR_NETWORK === "mainnet" ? Networks.PUBLIC : Networks.TESTNET;
 const LOCAL_STATE_KEY = "soroban_sandbox_local_state";
 
+export interface LedgerIO {
+  readBytes: number;
+  writeBytes: number;
+  readEntries: number;
+  writeEntries: number;
+}
+
+export interface ResourceBudget {
+  cpuInsns: number;
+  memBytes: number;
+  ledgerIO?: LedgerIO | null;
+  minResourceFee?: string | null;
+  ledgerIOUnavailable?: boolean;
+  feeUnavailable?: boolean;
+}
+
+export interface BudgetDelta {
+  diff: number | null;
+  percent: number | null;
+  status: "increased" | "decreased" | "unchanged" | "baseline" | "unavailable";
+}
+
+export interface SimulationBudgetDeltas {
+  cpu: BudgetDelta;
+  mem: BudgetDelta;
+  ledgerReadBytes: BudgetDelta;
+  ledgerWriteBytes: BudgetDelta;
+  ledgerEntries: BudgetDelta;
+  fee: BudgetDelta;
+}
+
+export interface SandboxCheckpoint {
+  id: string;
+  name: string;
+  createdAt: string;
+  files: Record<string, SandboxFile>;
+  description?: string;
+}
+
+export interface SandboxScenario {
+  id: string;
+  name: string;
+  contractId: string;
+  fn: string;
+  args: string;
+  description?: string;
+  createdAt: string;
+}
+
 export interface SimulationResult {
   mode: "remote" | "local";
   returnValue?: string;
@@ -142,8 +191,47 @@ export interface SimulationResult {
   events: string[];
   cpuInsns: number;
   memBytes: number;
+  ledgerIO?: LedgerIO | null;
+  minResourceFee?: string | null;
+  ledgerIOUnavailable?: boolean;
+  feeUnavailable?: boolean;
+  budgetDeltas?: SimulationBudgetDeltas;
   stateDiff: { key: string; before: string | null; after: string | null }[];
   warnings: string[];
+}
+
+export function calculateBudgetDeltas(
+  current: ResourceBudget,
+  previous: ResourceBudget | null,
+): SimulationBudgetDeltas {
+  function getDelta(currVal: number | null | undefined, prevVal: number | null | undefined, isUnavailable: boolean): BudgetDelta {
+    if (isUnavailable || currVal === null || currVal === undefined) {
+      return { diff: null, percent: null, status: "unavailable" };
+    }
+    if (!previous || prevVal === null || prevVal === undefined) {
+      return { diff: 0, percent: 0, status: "baseline" };
+    }
+    const diff = currVal - prevVal;
+    const percent = prevVal > 0 ? (diff / prevVal) * 100 : (diff === 0 ? 0 : 100);
+    const status = diff > 0 ? "increased" : diff < 0 ? "decreased" : "unchanged";
+    return { diff, percent, status };
+  }
+
+  const feeCurr = current.minResourceFee != null ? Number(current.minResourceFee) : null;
+  const feePrev = previous?.minResourceFee != null ? Number(previous.minResourceFee) : null;
+
+  return {
+    cpu: getDelta(current.cpuInsns, previous?.cpuInsns, false),
+    mem: getDelta(current.memBytes, previous?.memBytes, false),
+    ledgerReadBytes: getDelta(current.ledgerIO?.readBytes, previous?.ledgerIO?.readBytes, !!current.ledgerIOUnavailable),
+    ledgerWriteBytes: getDelta(current.ledgerIO?.writeBytes, previous?.ledgerIO?.writeBytes, !!current.ledgerIOUnavailable),
+    ledgerEntries: getDelta(
+      current.ledgerIO ? current.ledgerIO.readEntries + current.ledgerIO.writeEntries : null,
+      previous?.ledgerIO ? previous.ledgerIO.readEntries + previous.ledgerIO.writeEntries : null,
+      !!current.ledgerIOUnavailable
+    ),
+    fee: getDelta(feeCurr, feePrev, !!current.feeUnavailable),
+  };
 }
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
@@ -196,15 +284,41 @@ async function simulateViaRpc(contractId: string, fn: string, args: xdr.ScVal[])
   return res.json();
 }
 
-export async function simulateRemote(contractId: string, fn: string, args: xdr.ScVal[]): Promise<SimulationResult> {
+export async function simulateRemote(
+  contractId: string,
+  fn: string,
+  args: xdr.ScVal[],
+  previousBudget: ResourceBudget | null = null,
+): Promise<SimulationResult> {
   const sim = await simulateViaRpc(contractId, fn, args);
+  const ledgerIO: LedgerIO | null = sim.ledgerIO ?? null;
+  const minResourceFee: string | null = sim.minResourceFee ?? null;
+  const ledgerIOUnavailable = !ledgerIO;
+  const feeUnavailable = minResourceFee == null;
+
+  const budget: ResourceBudget = {
+    cpuInsns: Number(sim.cost?.cpuInsns ?? 0),
+    memBytes: Number(sim.cost?.memBytes ?? 0),
+    ledgerIO,
+    minResourceFee,
+    ledgerIOUnavailable,
+    feeUnavailable,
+  };
+
+  const budgetDeltas = calculateBudgetDeltas(budget, previousBudget);
+
   return {
     mode: "remote",
     returnValue: sim.returnValue,
     error: sim.success ? undefined : sim.error,
     events: sim.events ?? [],
-    cpuInsns: Number(sim.cost?.cpuInsns ?? 0),
-    memBytes: Number(sim.cost?.memBytes ?? 0),
+    cpuInsns: budget.cpuInsns,
+    memBytes: budget.memBytes,
+    ledgerIO,
+    minResourceFee,
+    ledgerIOUnavailable,
+    feeUnavailable,
+    budgetDeltas,
     stateDiff: [],
     warnings: [],
   };
@@ -280,7 +394,12 @@ export class LocalSandboxHost {
     return data.entries.length;
   }
 
-  async simulate(contractId: string, fn: string, args: xdr.ScVal[]): Promise<SimulationResult> {
+  async simulate(
+    contractId: string,
+    fn: string,
+    args: xdr.ScVal[],
+    previousBudget: ResourceBudget | null = null,
+  ): Promise<SimulationResult> {
     const out = await this.call<{
       result: string | null;
       error: string | null;
@@ -298,6 +417,18 @@ export class LocalSandboxHost {
         `Bundled host is protocol ${this.protocolVersion} but imported state is from protocol ${this.networkProtocol}; results may differ from the network.`,
       );
     }
+
+    const budget: ResourceBudget = {
+      cpuInsns: out.budget.cpuInsns,
+      memBytes: out.budget.memBytes,
+      ledgerIO: null,
+      minResourceFee: null,
+      ledgerIOUnavailable: true,
+      feeUnavailable: true,
+    };
+
+    const budgetDeltas = calculateBudgetDeltas(budget, previousBudget);
+
     return {
       mode: "local",
       returnValue: out.result ?? undefined,
@@ -305,6 +436,11 @@ export class LocalSandboxHost {
       events: out.events,
       cpuInsns: out.budget.cpuInsns,
       memBytes: out.budget.memBytes,
+      ledgerIO: null,
+      minResourceFee: null,
+      ledgerIOUnavailable: true,
+      feeUnavailable: true,
+      budgetDeltas,
       stateDiff: out.stateDiff,
       warnings,
     };
@@ -332,260 +468,139 @@ function mergeLocalState(update: LocalState): LocalState {
   return merged;
 }
 
-// ── Replay, Protocol Comparison, Scenario Collections, and Auth Validation (#1090-#1093) ──
+// ── Sandbox Checkpoints & Scenarios (#1098) ──────────────────────────────────
 
-export interface ContractCallScenario {
-  id?: string;
-  name?: string;
-  description?: string;
-  contractId: string;
-  fn: string;
-  args: any[] | string;
-  auth?: string[];
-  env?: {
-    protocolVersion?: number;
-    sequence?: number;
-    timestamp?: number;
-    networkPassphrase?: string;
-    ledgerEntries?: any[];
+export async function createCheckpoint(
+  sandboxId: string,
+  name: string,
+  description?: string,
+  files?: Map<string, SandboxFile>,
+): Promise<SandboxCheckpoint> {
+  const filesObj: Record<string, SandboxFile> = {};
+  if (files) {
+    for (const [key, file] of files) filesObj[key] = file;
+  }
+
+  try {
+    const response = await fetch(`${API_BASE}/api/sandbox/${sandboxId}/checkpoints`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, description, files: files ? filesObj : undefined }),
+    });
+    if (response.ok) {
+      const data = await response.json();
+      return data.checkpoint;
+    }
+  } catch {
+    // offline fallback
+  }
+
+  const checkpoint: SandboxCheckpoint = {
+    id: `chk_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+    name: name.trim(),
+    description: description?.trim() || "",
+    createdAt: new Date().toISOString(),
+    files: filesObj,
   };
-  baselineResult?: {
-    returnValue?: string;
-    error?: string;
-    cost?: { cpuInsns: number; memBytes: number };
-    events?: string[];
-  } | null;
+  const key = `checkpoints_${sandboxId}`;
+  const existing: SandboxCheckpoint[] = JSON.parse(localStorage.getItem(key) || "[]");
+  existing.push(checkpoint);
+  localStorage.setItem(key, JSON.stringify(existing));
+  return checkpoint;
 }
 
-export interface ReplayResult {
-  success: boolean;
-  scenarioId?: string;
-  scenarioName?: string;
-  isDeterministic: boolean;
-  isLedgerDependent: boolean;
-  ledgerDependencies: string[];
-  warning?: string | null;
-  replayResult: {
-    success: boolean;
-    returnValue?: string;
-    error?: string;
-    cost: { cpuInsns: number; memBytes: number };
-    events: string[];
+export async function listCheckpoints(
+  sandboxId: string,
+): Promise<{ checkpoints: SandboxCheckpoint[]; scenarios: SandboxScenario[] }> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sandbox/${sandboxId}/checkpoints`);
+    if (response.ok) {
+      return response.json();
+    }
+  } catch {
+    // offline fallback
+  }
+
+  const checkpointsKey = `checkpoints_${sandboxId}`;
+  const scenariosKey = `scenarios_${sandboxId}`;
+  return {
+    checkpoints: JSON.parse(localStorage.getItem(checkpointsKey) || "[]"),
+    scenarios: JSON.parse(localStorage.getItem(scenariosKey) || "[]"),
   };
-  comparison?: {
-    matched: boolean;
-    returnValueMatch: boolean;
-    errorMatch: boolean;
-    costDelta: { cpuInsns: number; memBytes: number };
-  } | null;
-  environmentAssumptions?: Record<string, any>;
 }
 
-export interface ProtocolComparisonResult {
-  success: boolean;
-  contractId: string;
-  fn: string;
-  supportedProtocols: number[];
-  comparisons: Array<{
-    protocol: number;
-    label: string;
-    environment: {
-      protocol: number;
-      network: string;
-      status: string;
-      wasmSpec?: string;
-      hostFeatures?: string[];
-    };
-    success: boolean;
-    returnValue?: string;
-    cost: { cpuInsns: number; memBytes: number };
-    minResourceFee: number;
-    events: string[];
-    error?: string;
-  }>;
-  deltas: Array<{
-    baselineProtocol: number;
-    comparedProtocol: number;
-    cpuDelta: number;
-    cpuPercentChange: number;
-    memDelta: number;
-    memPercentChange: number;
-    returnValueMatch: boolean;
-    errorMatch: boolean;
-  }>;
-  summary: string;
-}
-
-export interface ScenarioCollection {
-  id: string;
-  name: string;
-  description: string;
-  scenarios: ContractCallScenario[];
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface AuthValidationResult {
-  valid: boolean;
-  contractId: string;
-  function: string;
-  requiredEntries: Array<{
-    signer: string;
-    scope: string;
-    reason: string;
-    status: "present" | "missing" | "malformed";
-  }>;
-  missing: Array<{
-    signer: string;
-    scope: string;
-    reason: string;
-  }>;
-  malformed: Array<{
-    index?: number;
-    field?: string;
-    entry?: any;
-    error: string;
-  }>;
-  providedEntries: Array<{
-    signer: string;
-    credentialType: string;
-    scopes: string[];
-  }>;
-  explanation: string;
-}
-
-export async function replayScenario(scenario: ContractCallScenario): Promise<ReplayResult> {
-  const res = await fetch(`${API_BASE}/api/sandbox/replay`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(scenario),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `Replay failed: ${res.statusText}`);
+export async function resetToCheckpoint(
+  sandboxId: string,
+  checkpointId: string,
+): Promise<{ restoredFiles: Record<string, SandboxFile>; retainedScenariosCount: number }> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sandbox/${sandboxId}/reset`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ checkpointId, confirm: true }),
+    });
+    if (response.ok) {
+      const data = await response.json();
+      return { restoredFiles: data.files, retainedScenariosCount: data.retainedScenariosCount };
+    }
+  } catch {
+    // offline fallback
   }
-  return res.json();
+
+  const checkpointsKey = `checkpoints_${sandboxId}`;
+  const scenariosKey = `scenarios_${sandboxId}`;
+  const checkpoints: SandboxCheckpoint[] = JSON.parse(localStorage.getItem(checkpointsKey) || "[]");
+  const scenarios: SandboxScenario[] = JSON.parse(localStorage.getItem(scenariosKey) || "[]");
+  const target = checkpoints.find((c) => c.id === checkpointId || c.name === checkpointId);
+  if (!target) throw new Error("Checkpoint not found");
+
+  return {
+    restoredFiles: target.files,
+    retainedScenariosCount: scenarios.length,
+  };
 }
 
-export async function compareProtocols(
-  contractId: string,
-  fn: string,
-  args: any[] = [],
-  protocols?: number[],
-  env?: Record<string, any>,
-): Promise<ProtocolComparisonResult> {
-  const res = await fetch(`${API_BASE}/api/sandbox/compare-protocols`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ contractId, fn, args, protocols, env }),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `Protocol comparison failed: ${res.statusText}`);
+export async function saveScenario(
+  sandboxId: string,
+  scenario: Omit<SandboxScenario, "id" | "createdAt">,
+): Promise<SandboxScenario> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sandbox/${sandboxId}/scenarios`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(scenario),
+    });
+    if (response.ok) {
+      const data = await response.json();
+      return data.scenario;
+    }
+  } catch {
+    // offline fallback
   }
-  return res.json();
+
+  const item: SandboxScenario = {
+    ...scenario,
+    id: `scen_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+    createdAt: new Date().toISOString(),
+  };
+  const key = `scenarios_${sandboxId}`;
+  const existing: SandboxScenario[] = JSON.parse(localStorage.getItem(key) || "[]");
+  existing.push(item);
+  localStorage.setItem(key, JSON.stringify(existing));
+  return item;
 }
 
-export async function listCollections(
-  limit: number = 50,
-  offset: number = 0,
-): Promise<{
-  collections: Array<{
-    id: string;
-    name: string;
-    description: string;
-    scenarioCount: number;
-    createdAt: string;
-    updatedAt: string;
-  }>;
-  total: number;
-}> {
-  const res = await fetch(`${API_BASE}/api/sandbox/collections?limit=${limit}&offset=${offset}`);
-  if (!res.ok) throw new Error(`Failed to list scenario collections: ${res.statusText}`);
-  return res.json();
-}
-
-export async function getCollection(id: string): Promise<ScenarioCollection> {
-  const res = await fetch(`${API_BASE}/api/sandbox/collections/${id}`);
-  if (!res.ok) throw new Error(`Failed to get scenario collection: ${res.statusText}`);
-  return res.json();
-}
-
-export async function saveCollection(
-  collection: Partial<ScenarioCollection>,
-): Promise<{ collection: ScenarioCollection; strippedSecretsCount: number }> {
-  const res = await fetch(`${API_BASE}/api/sandbox/collections`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(collection),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `Failed to save scenario collection: ${res.statusText}`);
+export async function listScenarios(sandboxId: string): Promise<SandboxScenario[]> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sandbox/${sandboxId}/scenarios`);
+    if (response.ok) {
+      const data = await response.json();
+      return data.scenarios ?? [];
+    }
+  } catch {
+    // offline fallback
   }
-  return res.json();
-}
 
-export async function deleteCollection(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/sandbox/collections/${id}`, {
-    method: "DELETE",
-  });
-  if (!res.ok) throw new Error(`Failed to delete scenario collection: ${res.statusText}`);
-}
-
-export async function exportCollection(collectionIdOrData: string | Partial<ScenarioCollection>): Promise<{
-  version: number;
-  exportedAt: string;
-  schema: string;
-  collection: ScenarioCollection;
-  strippedSecretsCount: number;
-}> {
-  const payload =
-    typeof collectionIdOrData === "string" ? { collectionId: collectionIdOrData } : { collection: collectionIdOrData };
-  const res = await fetch(`${API_BASE}/api/sandbox/collections/export`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `Failed to export scenario collection: ${res.statusText}`);
-  }
-  return res.json();
-}
-
-export async function importCollection(data: string | Record<string, any>): Promise<{
-  success: boolean;
-  collection: ScenarioCollection;
-  strippedSecretsCount: number;
-}> {
-  const res = await fetch(`${API_BASE}/api/sandbox/collections/import`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: typeof data === "string" ? data : JSON.stringify(data),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `Failed to import scenario collection: ${res.statusText}`);
-  }
-  return res.json();
-}
-
-export async function validateSimulationAuth(
-  contractId: string,
-  fn: string,
-  args: any[] = [],
-  auth: string[] = [],
-  sourceAccount?: string,
-): Promise<AuthValidationResult> {
-  const res = await fetch(`${API_BASE}/api/sandbox/validate-auth`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ contractId, fn, args, auth, sourceAccount }),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `Auth validation request failed: ${res.statusText}`);
-  }
-  return res.json();
+  const key = `scenarios_${sandboxId}`;
+  return JSON.parse(localStorage.getItem(key) || "[]");
 }

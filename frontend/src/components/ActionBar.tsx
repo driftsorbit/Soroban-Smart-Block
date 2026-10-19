@@ -6,9 +6,16 @@ import "../styles/ActionBar.css";
 interface ActionBarProps {
   files: Map<string, SandboxFile>;
   sandboxId: string | null;
+  onResetEnvironment?: () => void;
+  onSaveCheckpoint?: () => void;
 }
 
-const ActionBar: React.FC<ActionBarProps> = ({ files, sandboxId }) => {
+const ActionBar: React.FC<ActionBarProps> = ({
+  files,
+  sandboxId,
+  onResetEnvironment,
+  onSaveCheckpoint,
+}) => {
   const [copied, setCopied] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
 
@@ -36,6 +43,15 @@ const ActionBar: React.FC<ActionBarProps> = ({ files, sandboxId }) => {
             {copied ? "✓ Copied" : "🔗 Share"}
           </button>
         )}
+        {onResetEnvironment && (
+          <button
+            className="action-btn"
+            onClick={onResetEnvironment}
+            title="Reset sandbox state to named checkpoint (non-destructive)"
+          >
+            ↺ Reset
+          </button>
+        )}
       </div>
 
       <div className="menu">
@@ -44,6 +60,17 @@ const ActionBar: React.FC<ActionBarProps> = ({ files, sandboxId }) => {
         </button>
         {showMenu && (
           <div className="menu-dropdown">
+            {onSaveCheckpoint && (
+              <button
+                className="menu-item"
+                onClick={() => {
+                  onSaveCheckpoint();
+                  setShowMenu(false);
+                }}
+              >
+                Create Checkpoint
+              </button>
+            )}
             <button className="menu-item">Save</button>
             <button className="menu-item">Fork</button>
             <button className="menu-item">Settings</button>

@@ -78,6 +78,7 @@ export interface ApiKeyRecord {
   allowed_contract_ids?: string[] | null;
   allowed_origins?: string[] | null;
   revoked: boolean;
+  revoked_at?: string | null;
   last_used_at: string | null;
   usage_count: number;
   created_at: string;

@@ -26,6 +26,7 @@ const UPDATABLE_FIELDS = [
   'allowed_endpoints',
   'expires_at',
   'revoked',
+  'revoked_at',
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -72,8 +73,8 @@ async function listKeys(page = 1, limit = 50) {
   const [{ rows }, { rows: countRows }] = await Promise.all([
     pool.query(
       `SELECT id, name, key_prefix, tier, rate_limit, daily_limit,
-              allowed_ips, allowed_endpoints, expires_at,
-              revoked, last_used_at, usage_count, created_at, updated_at
+              allowed_ips, allowed_endpoints, scopes, allowed_contract_ids, allowed_origins,
+              expires_at, revoked, revoked_at, last_used_at, usage_count, created_at, updated_at
        FROM api_keys
        ORDER BY created_at DESC
        LIMIT $1 OFFSET $2`,
@@ -158,7 +159,7 @@ async function createKey(data, { allowAdmin = false } = {}) {
      RETURNING id, name, email, key_prefix, tier, rate_limit, daily_limit,
                allowed_ips, allowed_endpoints, expires_at,
                scopes, allowed_contract_ids, allowed_origins,
-               revoked, last_used_at, usage_count, created_at, updated_at`,
+               revoked, revoked_at, last_used_at, usage_count, created_at, updated_at`,
     [
       name.trim(),
       email ?? null,
@@ -233,7 +234,8 @@ async function updateKey(id, updates) {
      WHERE id = $${idParam}
      RETURNING id, name, email, key_prefix, tier, rate_limit, daily_limit,
                allowed_ips, allowed_endpoints, expires_at,
-               revoked, last_used_at, usage_count, created_at, updated_at`,
+               scopes, allowed_contract_ids, allowed_origins,
+               revoked, revoked_at, last_used_at, usage_count, created_at, updated_at`,
     params,
   );
 
@@ -257,11 +259,12 @@ async function deleteKey(id) {
 
   const { rows } = await pool.query(
     `UPDATE api_keys
-     SET revoked = TRUE, updated_at = NOW()
+     SET revoked = TRUE, revoked_at = NOW(), updated_at = NOW()
      WHERE id = $1
      RETURNING id, name, email, key_prefix, tier, rate_limit, daily_limit,
                allowed_ips, allowed_endpoints, expires_at,
-               revoked, last_used_at, usage_count, created_at, updated_at`,
+               scopes, allowed_contract_ids, allowed_origins,
+               revoked, revoked_at, last_used_at, usage_count, created_at, updated_at`,
     [id],
   );
 
@@ -293,7 +296,8 @@ async function rotateKey(id) {
 
     // Load the existing record to copy metadata.
     const { rows: existingRows } = await client.query(
-      `SELECT name, email, tier, rate_limit, daily_limit, allowed_ips, allowed_endpoints, expires_at, verified
+      `SELECT name, email, tier, rate_limit, daily_limit, allowed_ips, allowed_endpoints, expires_at, verified,
+              scopes, allowed_contract_ids, allowed_origins
        FROM api_keys WHERE id = $1 FOR UPDATE`,
       [id],
     );
@@ -312,11 +316,13 @@ async function rotateKey(id) {
 
     const { rows: insertRows } = await client.query(
       `INSERT INTO api_keys
-         (name, email, key_hash, key_prefix, tier, rate_limit, daily_limit, allowed_ips, allowed_endpoints, expires_at, verified)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         (name, email, key_hash, key_prefix, tier, rate_limit, daily_limit, allowed_ips, allowed_endpoints, expires_at, verified,
+          scopes, allowed_contract_ids, allowed_origins)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING id, name, email, key_prefix, tier, rate_limit, daily_limit,
                  allowed_ips, allowed_endpoints, expires_at,
-                 revoked, last_used_at, usage_count, created_at, updated_at`,
+                 scopes, allowed_contract_ids, allowed_origins,
+                 revoked, revoked_at, last_used_at, usage_count, created_at, updated_at`,
       [
         existing.name,
         existing.email ?? null,
@@ -329,6 +335,9 @@ async function rotateKey(id) {
         existing.allowed_endpoints ?? null,
         existing.expires_at ?? null,
         existing.verified ?? null,
+        existing.scopes ?? null,
+        existing.allowed_contract_ids ?? null,
+        existing.allowed_origins ?? null,
       ],
     );
 
@@ -339,6 +348,7 @@ async function rotateKey(id) {
     await client.query(
       `UPDATE api_keys
        SET revoked = TRUE,
+           revoked_at = NOW(),
            rotated_at = NOW(),
            rotation_grace_until = $1,
            updated_at = NOW()
@@ -407,8 +417,8 @@ async function getKeyUsage(id) {
 async function getKeyById(id) {
   const { rows } = await pool.query(
     `SELECT id, name, email, key_prefix, tier, rate_limit, daily_limit,
-            allowed_ips, allowed_endpoints, expires_at,
-            revoked, verified, last_used_at, usage_count, created_at, updated_at
+            allowed_ips, allowed_endpoints, scopes, allowed_contract_ids, allowed_origins,
+            expires_at, revoked, revoked_at, verified, last_used_at, usage_count, created_at, updated_at
      FROM api_keys WHERE id = $1`,
     [id],
   );
@@ -428,8 +438,8 @@ async function listKeysForOwner(id) {
 
   const { rows } = await pool.query(
     `SELECT id, name, email, key_prefix, tier, rate_limit, daily_limit,
-            allowed_ips, allowed_endpoints, expires_at,
-            revoked, verified, last_used_at, usage_count, created_at, updated_at
+            allowed_ips, allowed_endpoints, scopes, allowed_contract_ids, allowed_origins,
+            expires_at, revoked, revoked_at, verified, last_used_at, usage_count, created_at, updated_at
      FROM api_keys WHERE email = $1 ORDER BY created_at DESC`,
     [self.email],
   );

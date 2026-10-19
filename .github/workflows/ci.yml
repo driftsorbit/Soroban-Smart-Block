@@ -285,6 +285,35 @@ jobs:
         run: npm audit --omit=dev --audit-level=high
         working-directory: indexer
 
+  # ── Lint (#977) ───────────────────────────────────────────────────────────
+  # Fails on ESLint errors in either package. Prettier is not enforced yet:
+  # the existing tree needs a one-time format before it can be checked in CI.
+  lint:
+    name: Lint (ESLint, indexer + frontend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install indexer deps
+        run: npm ci
+        working-directory: indexer
+
+      - name: ESLint (indexer)
+        run: npx eslint .
+        working-directory: indexer
+
+      - name: Install frontend deps
+        run: npm ci
+        working-directory: frontend
+
+      - name: ESLint (frontend)
+        run: npx eslint .
+        working-directory: frontend
+
   # ── Frontend Tests ────────────────────────────────────────────────────────
   frontend-tests:
     name: Frontend Tests (Vitest + React Testing Library)

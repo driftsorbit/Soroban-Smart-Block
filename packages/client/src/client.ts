@@ -34,6 +34,31 @@ import type {
 
 // ── Client options ─────────────────────────────────────────────────────────────
 
+export interface ClientRetryOptions {
+  /** Maximum number of retry attempts. Default: 3. */
+  maxRetries?: number;
+  /** Initial delay in ms before first retry. Default: 500ms. */
+  initialDelayMs?: number;
+  /** Maximum delay in ms between retries. Default: 10000ms. */
+  maxDelayMs?: number;
+  /** Backoff multiplier. Default: 2. */
+  backoffFactor?: number;
+  /** Whether to add jitter. Default: true. */
+  jitter?: boolean;
+  /** Status codes eligible for retry. Default: [408, 429, 500, 502, 503, 504]. */
+  retryableStatusCodes?: number[];
+  /** Safe methods eligible for retry. Default: ['GET', 'HEAD', 'OPTIONS']. */
+  retryableMethods?: string[];
+  /** Callback fired before each retry attempt. */
+  onRetry?: (context: { attempt: number; delayMs: number; error?: Error; status?: number }) => void;
+}
+
+export interface ClientRequestInit extends RequestInit {
+  timeout?: number;
+  retry?: ClientRetryOptions | boolean;
+  idempotent?: boolean;
+}
+
 export interface ClientOptions {
   /** Base URL of the Soroban Explorer API (e.g. "https://explorer.example.com"). */
   baseUrl: string;
@@ -41,6 +66,10 @@ export interface ClientOptions {
   apiKey?: string;
   /** Custom fetch implementation (defaults to globalThis.fetch). */
   fetch?: typeof globalThis.fetch;
+  /** Default request timeout in milliseconds. */
+  timeout?: number;
+  /** Default retry options or boolean. */
+  retry?: ClientRetryOptions | boolean;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -80,6 +109,8 @@ export class SorobanExplorerClient {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
   private readonly _fetch: typeof globalThis.fetch;
+  private readonly timeout?: number;
+  private readonly retry?: ClientRetryOptions | boolean;
 
   constructor(options: ClientOptions) {
     if (!options.baseUrl) {
@@ -88,6 +119,8 @@ export class SorobanExplorerClient {
     this.baseUrl = stripTrailingSlash(options.baseUrl);
     this.apiKey = options.apiKey;
     this._fetch = options.fetch ?? globalThis.fetch;
+    this.timeout = options.timeout;
+    this.retry = options.retry;
 
     if (!this._fetch) {
       throw new Error("No fetch implementation available. Pass a custom fetch function or use Node.js >= 18.");
@@ -96,44 +129,191 @@ export class SorobanExplorerClient {
 
   // ── Internal request helper ────────────────────────────────────────────────
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
-    const headers: Record<string, string> = {
-      Accept: "application/json",
-      ...(init?.headers as Record<string, string> | undefined),
-    };
+  private async request<T>(path: string, init?: ClientRequestInit): Promise<T> {
+    const method = (init?.method || "GET").toUpperCase();
+    const timeoutMs = init?.timeout ?? this.timeout;
+    const effectiveRetry = init?.retry !== undefined ? init?.retry : this.retry;
 
-    if (this.apiKey) {
-      headers["x-api-key"] = this.apiKey;
-    }
+    const retryPolicy: ClientRetryOptions | null =
+      effectiveRetry === false
+        ? null
+        : typeof effectiveRetry === "object"
+          ? {
+              maxRetries: 3,
+              initialDelayMs: 500,
+              maxDelayMs: 10000,
+              backoffFactor: 2,
+              jitter: true,
+              retryableStatusCodes: [408, 429, 500, 502, 503, 504],
+              retryableMethods: ["GET", "HEAD", "OPTIONS"],
+              ...effectiveRetry,
+            }
+          : effectiveRetry === true
+            ? {
+                maxRetries: 3,
+                initialDelayMs: 500,
+                maxDelayMs: 10000,
+                backoffFactor: 2,
+                jitter: true,
+                retryableStatusCodes: [408, 429, 500, 502, 503, 504],
+                retryableMethods: ["GET", "HEAD", "OPTIONS"],
+              }
+            : null;
 
-    const response = await this._fetch(`${this.baseUrl}${path}`, {
-      ...init,
-      headers,
-    });
+    const canRetryMethod =
+      Boolean(init?.idempotent) ||
+      (retryPolicy?.retryableMethods ?? ["GET", "HEAD", "OPTIONS"]).includes(method);
+    const maxRetries = retryPolicy?.maxRetries ?? 0;
 
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({ error: response.statusText }));
+    let attempt = 0;
+
+    while (true) {
+      attempt++;
+
+      if (init?.signal?.aborted) {
+        throw init.signal.reason ?? new Error("Request aborted");
+      }
+
+      let timer: any = null;
+      let timeoutController: AbortController | undefined;
+
+      if (timeoutMs && timeoutMs > 0) {
+        timeoutController = new AbortController();
+        timer = setTimeout(() => {
+          timeoutController?.abort(new Error(`Request timeout after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }
+
+      let compositeSignal: AbortSignal | null | undefined = init?.signal;
+      let cleanupSignals: () => void = () => {};
+
+      if (init?.signal && timeoutController) {
+        if (typeof (AbortSignal as any).any === "function") {
+          compositeSignal = (AbortSignal as any).any([init.signal, timeoutController.signal]);
+        } else {
+          const comp = new AbortController();
+          const onAbort = () => comp.abort();
+          init.signal.addEventListener("abort", onAbort, { once: true });
+          timeoutController.signal.addEventListener("abort", onAbort, { once: true });
+          cleanupSignals = () => {
+            init?.signal?.removeEventListener("abort", onAbort);
+            timeoutController?.signal.removeEventListener("abort", onAbort);
+          };
+          compositeSignal = comp.signal;
+        }
+      } else if (timeoutController) {
+        compositeSignal = timeoutController.signal;
+      }
+
+      const headers: Record<string, string> = {
+        Accept: "application/json",
+        ...(init?.headers as Record<string, string> | undefined),
+      };
+
+      if (this.apiKey) {
+        headers["x-api-key"] = this.apiKey;
+      }
+
+      let response: Response | undefined;
+      let networkError: Error | undefined;
+
+      try {
+        response = await this._fetch(`${this.baseUrl}${path}`, {
+          ...init,
+          headers,
+          signal: compositeSignal,
+        });
+      } catch (err: any) {
+        if (timer) clearTimeout(timer);
+        cleanupSignals();
+
+        if (init?.signal?.aborted) throw init.signal.reason ?? err;
+        if (timeoutController?.signal.aborted) throw timeoutController.signal.reason;
+
+        networkError = err;
+      } finally {
+        if (timer) clearTimeout(timer);
+        cleanupSignals();
+      }
+
+      if (response && response.ok) {
+        return response.json() as Promise<T>;
+      }
+
+      const status = response ? response.status : undefined;
+      const retryCodes = retryPolicy?.retryableStatusCodes ?? [408, 429, 500, 502, 503, 504];
+      const isStatusRetryable = status !== undefined && retryCodes.includes(status);
+      const isNetworkRetryable =
+        networkError !== undefined &&
+        !init?.signal?.aborted &&
+        !timeoutController?.signal.aborted;
+
+      const shouldRetry =
+        retryPolicy !== null &&
+        canRetryMethod &&
+        attempt <= maxRetries &&
+        (isStatusRetryable || isNetworkRetryable);
+
+      if (shouldRetry) {
+        let delayMs =
+          (retryPolicy.initialDelayMs ?? 500) *
+          Math.pow(retryPolicy.backoffFactor ?? 2, attempt - 1);
+        const retryAfterHeader = response?.headers.get("Retry-After");
+        if (retryAfterHeader) {
+          const parsed = Number(retryAfterHeader);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            delayMs = parsed * 1000;
+          }
+        }
+        delayMs = Math.min(delayMs, retryPolicy.maxDelayMs ?? 10000);
+        if (retryPolicy.jitter !== false) {
+          delayMs = delayMs * (1 + Math.random() * 0.25);
+        }
+
+        if (retryPolicy.onRetry) {
+          retryPolicy.onRetry({ attempt, delayMs, error: networkError, status });
+        }
+
+        await new Promise<void>((resolve, reject) => {
+          if (init?.signal?.aborted) return reject(init.signal.reason ?? new Error("Request aborted"));
+          const t = setTimeout(resolve, delayMs);
+          init?.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(t);
+              reject(init?.signal?.reason ?? new Error("Request aborted"));
+            },
+            { once: true },
+          );
+        });
+
+        continue;
+      }
+
+      if (networkError) {
+        throw networkError;
+      }
+
+      const body = await response!.json().catch(() => ({ error: response!.statusText }));
       const message =
-        (body as Record<string, unknown>).error ?? (body as Record<string, unknown>).detail ?? response.statusText;
+        (body as Record<string, unknown>).error ?? (body as Record<string, unknown>).detail ?? response!.statusText;
 
-      switch (response.status) {
+      switch (response!.status) {
         case 401:
           throw new UnauthorizedError(String(message), body);
         case 404:
           throw new NotFoundError(String(message), body);
         case 429: {
-          const retryAfter = Number(response.headers.get("Retry-After")) || 60;
+          const retryAfter = Number(response!.headers.get("Retry-After")) || 60;
           throw new RateLimitError(String(message), body, retryAfter);
         }
         case 400:
         case 422:
-          throw new ValidationError(String(message), response.status, body);
+          throw new ValidationError(String(message), response!.status, body);
         default:
-          throw new SorobanExplorerError(String(message), response.status, body);
+          throw new SorobanExplorerError(String(message), response!.status, body);
       }
     }
-
-    return response.json() as Promise<T>;
   }
 
   // ── Events ─────────────────────────────────────────────────────────────────

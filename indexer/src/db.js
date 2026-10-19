@@ -6,6 +6,7 @@ import { getIndexerNetwork } from "./networkConfig.js";
 import { decodeCursor, hashFilters, formatPageResponse } from "./cursor.js";
 import config from "./config.js";
 import { encryptSecret } from "./secrets/index.js";
+import { requestContext } from "./logger.js";
 
 // Migration 031 made `daemon_state` and `ledger_hashes` network-scoped:
 // their primary keys are now (network, key) and (network, ledger). Every
@@ -24,6 +25,66 @@ const replicaPools = String(process.env.READ_REPLICA_DATABASE_URLS || process.en
   .split(",").map((url) => url.trim()).filter(Boolean).map((connectionString) => new pg.Pool({ connectionString }));
 const replicaState = replicaPools.map((pool, index) => ({ pool, index, healthy: true, lagMs: 0, lastCheck: 0, replayLsn: null }));
 let lastWriteLsn = null;
+
+let _poolWaitTimes = [];
+const POOL_STATS_WINDOW = 100;
+let _maxWaitTimeMs = 0;
+
+export function recordPoolAcquire(waitMs) {
+  const ms = Math.max(0, Number(waitMs) || 0);
+  _poolWaitTimes.push(ms);
+  if (_poolWaitTimes.length > POOL_STATS_WINDOW) _poolWaitTimes.shift();
+  if (ms > _maxWaitTimeMs) _maxWaitTimeMs = ms;
+}
+
+export function resetPoolStats() {
+  _poolWaitTimes = [];
+  _maxWaitTimeMs = 0;
+}
+
+export function getPoolStats() {
+  const total = pool.totalCount || 0;
+  const idle = pool.idleCount || 0;
+  const waiting = pool.waitingCount || 0;
+  const active = Math.max(0, total - idle);
+  const max = pool.options?.max || (process.env.DATABASE_POOL_MAX ? parseInt(process.env.DATABASE_POOL_MAX, 10) : 10);
+  const saturation = max > 0 ? Number((active / max).toFixed(4)) : 0;
+  const avgWaitTimeMs = _poolWaitTimes.length > 0
+    ? Math.round(_poolWaitTimes.reduce((a, b) => a + b, 0) / _poolWaitTimes.length)
+    : 0;
+
+  return {
+    total,
+    idle,
+    active,
+    waiting,
+    max,
+    saturation,
+    avgWaitTimeMs,
+    maxWaitTimeMs: _maxWaitTimeMs,
+  };
+}
+
+const _rawConnect = pool.connect.bind(pool);
+pool.connect = function(cb) {
+  const start = Date.now();
+  if (typeof cb === "function") {
+    return _rawConnect((err, client, release) => {
+      recordPoolAcquire(Date.now() - start);
+      cb(err, client, release);
+    });
+  }
+  return _rawConnect().then(
+    (client) => {
+      recordPoolAcquire(Date.now() - start);
+      return client;
+    },
+    (err) => {
+      recordPoolAcquire(Date.now() - start);
+      throw err;
+    },
+  );
+};
 
 // Wrap every query in an OTel span (issue #755) so a request's trace shows
 // DB timing alongside its RPC and cache hops. Only instruments the
@@ -87,6 +148,68 @@ export const db = {
   queryRead,
   getReplicaState,
   getLastWriteLsn,
+  getPoolStats,
+  resetPoolStats,
+  async recordIncidentEvent(event) {
+    const { event_type, severity = "info", source = "indexer", summary, details = {} } = event;
+    const { rows } = await pool.query(
+      `INSERT INTO operator_incident_events (event_type, severity, source, summary, details, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING id, event_type, severity, source, summary, details, created_at`,
+      [event_type, severity, source, summary, JSON.stringify(details)],
+    );
+    return rows[0];
+  },
+  async getIncidentTimeline({ event_type, severity, source, from, to, limit = 50, offset = 0 } = {}) {
+    const conditions = [];
+    const params = [];
+    if (event_type) {
+      params.push(event_type);
+      conditions.push(`event_type = $${params.length}`);
+    }
+    if (severity) {
+      params.push(severity);
+      conditions.push(`severity = $${params.length}`);
+    }
+    if (source) {
+      params.push(source);
+      conditions.push(`source = $${params.length}`);
+    }
+    if (from) {
+      params.push(new Date(from).toISOString());
+      conditions.push(`created_at >= $${params.length}`);
+    }
+    if (to) {
+      params.push(new Date(to).toISOString());
+      conditions.push(`created_at <= $${params.length}`);
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const countRes = await queryRead(`SELECT COUNT(*)::INT as total FROM operator_incident_events ${where}`, [...params]);
+    const total = countRes.rows[0]?.total ?? 0;
+
+    const numLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+    const numOffset = Math.max(Number(offset) || 0, 0);
+
+    params.push(numLimit);
+    const lIdx = params.length;
+    params.push(numOffset);
+    const oIdx = params.length;
+
+    const { rows } = await queryRead(
+      `SELECT id, event_type, severity, source, summary, details, created_at
+       FROM operator_incident_events
+       ${where}
+       ORDER BY created_at DESC
+       LIMIT $${lIdx} OFFSET $${oIdx}`,
+      params,
+    );
+    return {
+      data: rows,
+      total,
+      limit: numLimit,
+      offset: numOffset,
+    };
+  },
   async getReplayRows(from, to) {
     const { rows } = await queryRead("SELECT * FROM events WHERE ledger BETWEEN $1 AND $2 ORDER BY ledger, seq", [from, to]);
     return rows;
@@ -425,7 +548,7 @@ export const db = {
 
     const hasExtraRow = rows.length > safeLimit;
     return formatPageResponse({
-      data: rows,
+      data: rows.map(attachDecodeProvenance),
       limit: safeLimit,
       hasExtraRow,
       isBackward,
@@ -444,7 +567,7 @@ export const db = {
       [network, after_seq, limit + 1],
     );
     const hasMore = rows.length > limit;
-    const data = hasMore ? rows.slice(0, limit) : rows;
+    const data = (hasMore ? rows.slice(0, limit) : rows).map(attachDecodeProvenance);
     return { data, next_cursor: data.length ? Number(data.at(-1).seq) : after_seq, has_more: hasMore };
   },
 
@@ -770,14 +893,14 @@ export const db = {
        FROM events WHERE network = $1 AND event_id = $2`,
       [network, eventId],
     );
-    return rows[0] ?? null;
+    return rows[0] ? attachDecodeProvenance(rows[0]) : null;
   },
 
   async getEvent(seq) {
     const sql = `SELECT *, CASE WHEN contract_id IS NULL OR contract_id = '' THEN 'classic' ELSE 'soroban' END AS type
                  FROM events WHERE seq = $1`;
     const { rows } = await pool.query(sql, [seq]);
-    return rows[0] ?? null;
+    return rows[0] ? attachDecodeProvenance(rows[0]) : null;
   },
 
   async getEventProof(seq) {
@@ -1391,7 +1514,7 @@ export const db = {
 
   async listAccountApiKeys(accountId) {
     const { rows } = await pool.query(
-      `SELECT id, name, key_prefix, tier, scopes, created_at, expires_at
+      `SELECT id, name, key_prefix, tier, scopes, allowed_contract_ids, allowed_origins, allowed_ips, allowed_endpoints, last_used_at, revoked, revoked_at, created_at, expires_at
        FROM api_keys WHERE account_id = $1 ORDER BY created_at DESC`,
       [accountId],
     );
@@ -1558,6 +1681,12 @@ export const db = {
     const sql = "SELECT * FROM contracts WHERE id = $1";
     const { rows } = await pool.query(sql, [id]);
     return rows[0] ?? null;
+  },
+
+  async getContractsBulkMeta(ids) {
+    if (!Array.isArray(ids) || ids.length === 0) return [];
+    const { rows } = await pool.query("SELECT * FROM contracts WHERE id = ANY($1)", [ids]);
+    return rows;
   },
 
   async listSandboxes({ cursor, after, before, page, limit = 25, offset, count } = {}) {
@@ -2175,15 +2304,23 @@ export const db = {
   /**
    * Aggregate event/caller counts for a contract, backing GET /api/contracts/:id/stats.
    * Relies on idx_events_contract_caller (migration 010) to stay fast at scale.
+   * Supports asOfLedger bounding (#1070).
    * @param {string} contractId
-   * @returns {Promise<{ total_events: number, unique_callers: number, first_seen_ledger: number|null, last_seen_ledger: number|null }>}
+   * @param {number|null} [asOfLedger=null]
+   * @returns {Promise<{ total_events: number, unique_callers: number, first_seen_ledger: number|null, last_seen_ledger: number|null, as_of_ledger: number|null, watermark: number|null }>}
    */
-  async getContractStats(contractId) {
+  async getContractStats(contractId, asOfLedger = null) {
+    const asOf = asOfLedger != null ? Number(asOfLedger) : null;
+    const ledgerFilter = asOf != null ? " AND ledger <= $2" : "";
+    const eventLedgerFilter = asOf != null ? " AND e.ledger <= $2" : "";
+    const params = [contractId];
+    if (asOf != null) params.push(asOf);
+
     const [{ rows: totals }, { rows: callerRows }] = await Promise.all([
       pool.query(
         `SELECT COUNT(*)::INT AS total_events, MIN(ledger) AS first_seen_ledger, MAX(ledger) AS last_seen_ledger
-         FROM events WHERE contract_id = $1`,
-        [contractId],
+         FROM events WHERE contract_id = $1${ledgerFilter}`,
+        params,
       ),
       // Unique caller addresses via regexp_matches on description + raw_topics + raw_data
       pool.query(
@@ -2197,16 +2334,19 @@ export const db = {
              'g'
            ) AS m
          ) a
-         WHERE e.contract_id = $1`,
-        [contractId],
+         WHERE e.contract_id = $1${eventLedgerFilter}`,
+        params,
       ),
     ]);
     const row = totals[0];
+    const lastSeen = row?.last_seen_ledger != null ? Number(row.last_seen_ledger) : null;
     return {
-      total_events: Number(row.total_events),
-      unique_callers: Number(callerRows[0].unique_callers),
-      first_seen_ledger: row.first_seen_ledger != null ? Number(row.first_seen_ledger) : null,
-      last_seen_ledger: row.last_seen_ledger != null ? Number(row.last_seen_ledger) : null,
+      total_events: Number(row?.total_events ?? 0),
+      unique_callers: Number(callerRows[0]?.unique_callers ?? 0),
+      first_seen_ledger: row?.first_seen_ledger != null ? Number(row.first_seen_ledger) : null,
+      last_seen_ledger: lastSeen,
+      as_of_ledger: asOf,
+      watermark: lastSeen,
     };
   },
 
@@ -2214,22 +2354,29 @@ export const db = {
    * Daily event counts for a contract over the trailing `days` days (including
    * today), oldest first. Days with no events are zero-filled so callers get a
    * fixed-length series to render a sparkline/bar chart from.
+   * Supports asOfLedger bounding (#1070).
    * @param {string} contractId
    * @param {number} [days=30]
+   * @param {number|null} [asOfLedger=null]
    * @returns {Promise<{ date: string, count: number }[]>}
    */
-  async getContractEventsByDay(contractId, days = 30) {
+  async getContractEventsByDay(contractId, days = 30, asOfLedger = null) {
     const safeDays = Math.min(Math.max(Number(days) || 30, 1), 365);
+    const asOf = asOfLedger != null ? Number(asOfLedger) : null;
+    const ledgerFilter = asOf != null ? " AND e.ledger <= $3" : "";
+    const params = [contractId, safeDays];
+    if (asOf != null) params.push(asOf);
+
     const { rows } = await pool.query(
       `SELECT d::date AS date, COUNT(e.seq)::INT AS count
        FROM generate_series(CURRENT_DATE - ($2::int - 1), CURRENT_DATE, interval '1 day') AS d
        LEFT JOIN events e
          ON e.contract_id = $1
          AND e.created_at >= d
-         AND e.created_at < d + interval '1 day'
+         AND e.created_at < d + interval '1 day'${ledgerFilter}
        GROUP BY d
        ORDER BY d ASC`,
-      [contractId, safeDays],
+      params,
     );
     return rows.map((r) => ({
       date: r.date.toISOString().slice(0, 10),
@@ -2599,7 +2746,7 @@ export const db = {
   /**
    * Collection-level NFT analytics (issue #810): mint volume over time and a
    * unique-holder-count trend, derived from already-indexed NFT mint/transfer
-   * events in the events table.
+   * events in the events table. Supports asOfLedger bounding (#1070).
    *
    * Mint events are `mint_nft` / `create` (the decoder's NFT mint functions,
    * #562). Transfers are `transfer` events on the collection contract. The
@@ -2612,16 +2759,20 @@ export const db = {
    *
    * @param {string} contractId
    * @param {number} [days=30]  Rolling window length, clamped to 7..365.
+   * @param {number|null} [asOfLedger=null]
    * @returns {Promise<{
    *   contract_id: string,
    *   days: number,
+   *   as_of_ledger: number|null,
+   *   watermark: number|null,
    *   totals: { minted: number, transfers: number, unique_holders: number },
    *   mint_volume: { date: string, count: number }[],
    *   holder_count: { date: string, count: number }[]
    * }>}
    */
-  async getNftCollectionAnalytics(contractId, days = 30) {
+  async getNftCollectionAnalytics(contractId, days = 30, asOfLedger = null) {
     const daysN = Math.min(365, Math.max(7, Number(days) || 30));
+    const asOf = asOfLedger != null ? Number(asOfLedger) : null;
 
     const recipientExpr = (table) =>
       `CASE
@@ -2632,14 +2783,25 @@ export const db = {
                        (regexp_match(COALESCE(${table}.description, ''), '\\m[GCM][A-Z2-7]{55}\\M'))[1])
        END`;
 
+    const ledgerFilter1 = asOf != null ? " AND ledger <= $2" : "";
+    const ledgerFilterE1 = asOf != null ? " AND e.ledger <= $2" : "";
+    const params1 = [contractId];
+    if (asOf != null) params1.push(asOf);
+
+    const ledgerFilter2 = asOf != null ? " AND ledger <= $3" : "";
+    const ledgerFilterE2 = asOf != null ? " AND e.ledger <= $3" : "";
+    const params2 = [contractId, daysN];
+    if (asOf != null) params2.push(asOf);
+
     const [totalsRes, mintRes, holderDailyRes, holderTotalRes] = await Promise.all([
       pool.query(
         `SELECT
            COUNT(*) FILTER (WHERE function IN ('mint_nft', 'create'))::INT AS minted,
-           COUNT(*) FILTER (WHERE function = 'transfer')::INT AS transfers
+           COUNT(*) FILTER (WHERE function = 'transfer')::INT AS transfers,
+           MAX(ledger)::BIGINT AS watermark
          FROM events
-         WHERE contract_id = $1`,
-        [contractId],
+         WHERE contract_id = $1${ledgerFilter1}`,
+        params1,
       ),
       // Daily mint volume within the rolling window
       pool.query(
@@ -2647,10 +2809,10 @@ export const db = {
          FROM events
          WHERE contract_id = $1
            AND function IN ('mint_nft', 'create')
-           AND created_at >= NOW() - make_interval(days => $2)
+           AND created_at >= NOW() - make_interval(days => $2)${ledgerFilter2}
          GROUP BY date
          ORDER BY date`,
-        [contractId, daysN],
+        params2,
       ),
       // Per-day *new* recipients within the rolling window — each address is
       // counted only on the first day it appears, so the cumulative curve in
@@ -2662,7 +2824,7 @@ export const db = {
            FROM events e
            WHERE e.contract_id = $1
              AND e.function IN ('mint_nft', 'create', 'transfer')
-             AND e.created_at >= NOW() - make_interval(days => $2)
+             AND e.created_at >= NOW() - make_interval(days => $2)${ledgerFilterE2}
          ),
          first_seen AS (
            SELECT date, recipient,
@@ -2674,7 +2836,7 @@ export const db = {
          FROM first_seen
          GROUP BY date
          ORDER BY date`,
-        [contractId, daysN],
+        params2,
       ),
       // All-time distinct recipients — the collection's unique holder count
       pool.query(
@@ -2682,12 +2844,12 @@ export const db = {
            SELECT ${recipientExpr("e")} AS recipient
            FROM events e
            WHERE e.contract_id = $1
-             AND e.function IN ('mint_nft', 'create', 'transfer')
+             AND e.function IN ('mint_nft', 'create', 'transfer')${ledgerFilterE1}
          )
          SELECT COUNT(DISTINCT recipient)::INT AS unique_holders
          FROM recipients
          WHERE recipient ~ '^[GCM][A-Z2-7]{55}$'`,
-        [contractId],
+        params1,
       ),
     ]);
 
@@ -2706,9 +2868,13 @@ export const db = {
       holder_count.push({ date, count: cumulative });
     }
 
+    const watermark = totalsRes.rows[0]?.watermark != null ? Number(totalsRes.rows[0].watermark) : null;
+
     return {
       contract_id: contractId,
       days: daysN,
+      as_of_ledger: asOf,
+      watermark,
       totals: {
         minted: totalsRes.rows[0].minted,
         transfers: totalsRes.rows[0].transfers,
@@ -2948,6 +3114,56 @@ export const db = {
    * @param {string} contractId
    * @returns {Promise<{ abi_version: number, functions: object[], registered_by: string, min_ledger: number, created_at: string }[]>}
    */
+  // Issue #1059 — apply a metadata correction and record it in one statement.
+  // `field` must already be validated against CORRECTABLE_FIELDS. Returns the
+  // correction row, or null when the contract does not exist.
+  async correctContractMetadata(contractId, { field, new_value, reason, actor }) {
+    // `field` is interpolated into SQL, so it is checked against the allowlist here too.
+    if (field !== "name" && field !== "description") throw new Error(`Field not correctable: ${field}`);
+    const { rows } = await pool.query(
+      `WITH cur AS (
+         SELECT id, ${field} AS old_value FROM contracts WHERE id = $1
+       ),
+       upd AS (
+         UPDATE contracts SET ${field} = $2 WHERE id = $1 AND EXISTS (SELECT 1 FROM cur) RETURNING id
+       )
+       INSERT INTO contract_metadata_corrections (contract_id, field, old_value, new_value, reason, actor)
+       SELECT cur.id, $3, cur.old_value, $2, $4, $5
+       FROM cur WHERE EXISTS (SELECT 1 FROM upd)
+       RETURNING id, contract_id, field, old_value, new_value, reason, actor, created_at`,
+      [contractId, new_value, field, reason, actor],
+    );
+    return rows[0] ?? null;
+  },
+
+  async getContractCorrections(contractId, limit = 100) {
+    const { rows } = await queryRead(
+      `SELECT id, contract_id, field, old_value, new_value, reason, actor, created_at
+       FROM contract_metadata_corrections
+       WHERE contract_id = $1
+       ORDER BY created_at DESC, id DESC
+       LIMIT $2`,
+      [contractId, limit],
+    );
+    return rows;
+  },
+
+  // Issue #1058 — per-function counts of events in [fromLedger, toLedger] and how
+  // many of them were decoded against an ABI/spec (see src/decodeCoverage.js).
+  async getDecodeCoverageByFunction(contractId, fromLedger, toLedger, decodedStatuses) {
+    const { rows } = await queryRead(
+      `SELECT function,
+              COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE decode_status = ANY($4::text[]))::int AS decoded
+       FROM events
+       WHERE contract_id = $1 AND ledger BETWEEN $2 AND $3
+       GROUP BY function
+       ORDER BY total DESC, function ASC`,
+      [contractId, fromLedger, toLedger, decodedStatuses],
+    );
+    return rows;
+  },
+
   async getContractAbiHistory(contractId) {
     const { rows } = await pool.query(
       `SELECT abi_version, functions, registered_by, min_ledger, created_at
@@ -3039,6 +3255,49 @@ export const db = {
   async getAsset(code, issuer) {
     const { rows } = await pool.query("SELECT * FROM assets WHERE code = $1 AND issuer = $2", [code, issuer]);
     return rows[0] ?? null;
+  },
+
+  /** Mint and burn events for a SAC contract, oldest first (#1067). */
+  async getSupplyEvents(contractId) {
+    const { rows } = await pool.query(
+      `SELECT seq, ledger, function, tx_hash, (raw_data::jsonb->>'amount') AS amount
+       FROM events
+       WHERE contract_id = $1 AND function IN ('mint', 'burn')
+       ORDER BY ledger ASC, seq ASC`,
+      [contractId],
+    );
+    return rows;
+  },
+
+  /** Latest market-data observation for an asset, or null (#1068). */
+  async getLatestAssetPrice(code, issuer) {
+    const { rows } = await pool.query(
+      `SELECT price, observed_at, source FROM asset_price_observations
+       WHERE code = $1 AND issuer = $2
+       ORDER BY observed_at DESC LIMIT 1`,
+      [code, issuer],
+    );
+    return rows[0] ?? null;
+  },
+
+  /** Token transfers for a contract within [from, to), for counterparty summaries (#1069). */
+  async getTransfersInRange(contractId, from, to) {
+    const { rows } = await pool.query(
+      `SELECT raw_data::jsonb->>'from' AS "from",
+              raw_data::jsonb->>'to'   AS "to",
+              raw_data::jsonb->>'amount' AS amount
+       FROM events
+       WHERE contract_id = $1 AND function = 'transfer'
+         AND created_at >= $2 AND created_at < $3`,
+      [contractId, from, to],
+    );
+    return rows;
+  },
+
+  /** All issuers that have published an asset with this code (#1066). */
+  async getAssetsByCode(code) {
+    const { rows } = await pool.query("SELECT code, issuer FROM assets WHERE code = $1 ORDER BY issuer", [code]);
+    return rows;
   },
 
   async upsertAsset({ code, issuer, name, domain, logo_url, decimals }) {
@@ -3249,6 +3508,219 @@ export const db = {
     );
     return rows[0] ?? null;
   },
+
+  /**
+   * Return all indexed events for a transaction hash in deterministic order with bounded size (#1072).
+   * Stable ordering: ORDER BY seq ASC (or DESC).
+   *
+   * @param {string} txHash
+   * @param {{ limit?: number, offset?: number, order?: string }} [opts]
+   * @returns {Promise<{ tx_hash: string, events: object[], data: object[], total: number, limit: number, offset: number }>}
+   */
+  async getTransactionEvents(txHash, { limit = 50, offset = 0, order = "asc" } = {}) {
+    const safeLimit = Math.min(Math.max(1, Number(limit) || 50), 200);
+    const safeOffset = Math.max(0, Number(offset) || 0);
+    const sortDir = String(order).toLowerCase() === "desc" ? "DESC" : "ASC";
+
+    const countRes = await pool.query(
+      `SELECT COUNT(*)::INT AS total
+       FROM events
+       WHERE tx_hash = $1 OR transaction_hash = $1`,
+      [txHash],
+    );
+    const total = Number(countRes.rows[0]?.total ?? 0);
+
+    const { rows } = await pool.query(
+      `SELECT *, CASE WHEN contract_id IS NULL OR contract_id = '' THEN 'classic' ELSE 'soroban' END AS type
+       FROM events
+       WHERE tx_hash = $1 OR transaction_hash = $1
+       ORDER BY seq ${sortDir}
+       LIMIT $2 OFFSET $3`,
+      [txHash, safeLimit, safeOffset],
+    );
+
+    const formatted = rows.map(attachDecodeProvenance);
+    return {
+      tx_hash: txHash,
+      events: formatted,
+      data: formatted,
+      total,
+      limit: safeLimit,
+      offset: safeOffset,
+    };
+  },
+
+  /**
+   * Provide bounded per-contract event counts by function and interval with partial-data indicators (#1073).
+   * Backs GET /api/contracts/:id/activity-summary.
+   *
+   * @param {string} contractId
+   * @param {{ interval?: string, range?: number|null, asOfLedger?: number|null }} [opts]
+   * @returns {Promise<{
+   *   contract_id: string,
+   *   interval: string,
+   *   range: number,
+   *   as_of_ledger: number|null,
+   *   watermark: number|null,
+   *   total_events: number,
+   *   by_function: { function: string, count: number }[],
+   *   intervals: { start: string, end: string, count: number, functions: Record<string, number>, is_partial: boolean }[],
+   *   partial_data: boolean,
+   *   partial_indicators: { as_of_ledger_bounded: boolean, incomplete_history: boolean, active_interval_incomplete: boolean, truncated_functions: boolean }
+   * }>}
+   */
+  async getContractActivitySummary(contractId, { interval = "day", range = null, asOfLedger = null } = {}) {
+    const normalizedInterval = ["hour", "day", "week"].includes(String(interval).toLowerCase())
+      ? String(interval).toLowerCase()
+      : "day";
+
+    const limits = {
+      hour: { min: 1, max: 168, default: 24 },
+      day: { min: 1, max: 90, default: 30 },
+      week: { min: 1, max: 52, default: 12 },
+    };
+
+    let safeRange;
+    if (range !== null && range !== undefined) {
+      safeRange = Number(range);
+    } else {
+      safeRange = limits[normalizedInterval].default;
+    }
+    safeRange = Math.min(Math.max(limits[normalizedInterval].min, safeRange), limits[normalizedInterval].max);
+
+    const asOf = asOfLedger != null ? Number(asOfLedger) : null;
+    const ledgerFilter = asOf != null ? " AND ledger <= $2" : "";
+    const params = [contractId];
+    if (asOf != null) params.push(asOf);
+
+    const now = Date.now();
+    const intervalMs =
+      normalizedInterval === "hour"
+        ? 3600 * 1000
+        : normalizedInterval === "day"
+        ? 86400 * 1000
+        : 7 * 86400 * 1000;
+    const windowStartMs = now - safeRange * intervalMs;
+    const windowStartDate = new Date(windowStartMs);
+
+    params.push(windowStartDate);
+    const windowStartParamIndex = params.length;
+
+    const [statsRes, funcRes, bucketRes] = await Promise.all([
+      pool.query(
+        `SELECT
+           COUNT(*)::INT AS total_events,
+           MAX(ledger)::BIGINT AS watermark,
+           MIN(ledger)::BIGINT AS first_seen_ledger,
+           MIN(created_at) AS first_event_time
+         FROM events
+         WHERE contract_id = $1${ledgerFilter}
+           AND created_at >= $${windowStartParamIndex}`,
+        params,
+      ),
+      pool.query(
+        `SELECT
+           COALESCE(NULLIF(function, ''), 'unknown') AS function,
+           COUNT(*)::INT AS count
+         FROM events
+         WHERE contract_id = $1${ledgerFilter}
+           AND created_at >= $${windowStartParamIndex}
+         GROUP BY function
+         ORDER BY count DESC
+         LIMIT 50`,
+        params,
+      ),
+      pool.query(
+        `SELECT
+           date_trunc('${normalizedInterval === "hour" ? "hour" : normalizedInterval === "day" ? "day" : "week"}', created_at) AS bucket,
+           COALESCE(NULLIF(function, ''), 'unknown') AS function,
+           COUNT(*)::INT AS count
+         FROM events
+         WHERE contract_id = $1${ledgerFilter}
+           AND created_at >= $${windowStartParamIndex}
+         GROUP BY bucket, function
+         ORDER BY bucket ASC`,
+        params,
+      ),
+    ]);
+
+    const totalEvents = statsRes.rows[0]?.total_events ?? 0;
+    const watermark = statsRes.rows[0]?.watermark != null ? Number(statsRes.rows[0].watermark) : null;
+    const firstEventTime = statsRes.rows[0]?.first_event_time ? new Date(statsRes.rows[0].first_event_time) : null;
+
+    const bucketMap = new Map();
+    for (const r of bucketRes.rows) {
+      const bucketKey = new Date(r.bucket).toISOString();
+      if (!bucketMap.has(bucketKey)) {
+        bucketMap.set(bucketKey, { total: 0, functions: {} });
+      }
+      const entry = bucketMap.get(bucketKey);
+      const cnt = Number(r.count);
+      entry.total += cnt;
+      entry.functions[r.function] = cnt;
+    }
+
+    const intervals = [];
+    const nowDate = new Date(now);
+    let currentBucketStartMs;
+    if (normalizedInterval === "hour") {
+      currentBucketStartMs = Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), nowDate.getUTCDate(), nowDate.getUTCHours());
+    } else if (normalizedInterval === "day") {
+      currentBucketStartMs = Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), nowDate.getUTCDate());
+    } else {
+      const day = nowDate.getUTCDay();
+      const diff = (day === 0 ? -6 : 1) - day;
+      const monday = new Date(nowDate);
+      monday.setUTCDate(nowDate.getUTCDate() + diff);
+      currentBucketStartMs = Date.UTC(monday.getUTCFullYear(), monday.getUTCMonth(), monday.getUTCDate());
+    }
+
+    for (let i = safeRange - 1; i >= 0; i--) {
+      const bucketStart = new Date(currentBucketStartMs - i * intervalMs);
+      const bucketEnd = new Date(bucketStart.getTime() + intervalMs);
+      const key = bucketStart.toISOString();
+      const existing = bucketMap.get(key) || { total: 0, functions: {} };
+
+      const isActiveInProgress = i === 0 && now < bucketEnd.getTime();
+      const isFirstSeenInInterval = firstEventTime != null && firstEventTime > bucketStart && firstEventTime < bucketEnd;
+      const isIntervalPartial = isActiveInProgress || isFirstSeenInInterval;
+
+      intervals.push({
+        start: bucketStart.toISOString(),
+        end: bucketEnd.toISOString(),
+        count: existing.total,
+        functions: existing.functions,
+        is_partial: isIntervalPartial,
+      });
+    }
+
+    const hasIncompleteHistory = firstEventTime != null && firstEventTime.getTime() > windowStartMs;
+    const isPartialData = asOf != null || hasIncompleteHistory || intervals.some((it) => it.is_partial);
+
+    return {
+      contract_id: contractId,
+      interval: normalizedInterval,
+      range: safeRange,
+      as_of_ledger: asOf,
+      watermark,
+      total_events: totalEvents,
+      by_function: funcRes.rows.map((r) => ({
+        function: r.function,
+        count: Number(r.count),
+      })),
+      intervals,
+      partial_data: isPartialData,
+      partial_indicators: {
+        as_of_ledger_bounded: asOf != null,
+        incomplete_history: hasIncompleteHistory,
+        active_interval_incomplete: true,
+        truncated_functions: funcRes.rows.length >= 50,
+      },
+    };
+  },
+
+  getEventDecodeProvenance,
+  attachDecodeProvenance,
 };
 
 function normalizeSearchTerms(q) {

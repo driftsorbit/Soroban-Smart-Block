@@ -223,10 +223,16 @@ export default function ApiKeysPanel() {
             <div>
               <strong>{key.name}</strong>{" "}
               <span className="badge">{key.tier}</span>{" "}
-              {key.revoked && <span className="badge" style={{ color: "#e5484d" }}>revoked</span>}
+              {key.revoked && (
+                <span className="badge" style={{ color: "#e5484d" }}>
+                  revoked{key.revoked_at ? ` (${new Date(key.revoked_at).toLocaleDateString()})` : ""}
+                </span>
+              )}
               <div style={{ fontSize: 12, color: "var(--muted)" }}>
                 {key.key_prefix}… · created {new Date(key.created_at).toLocaleDateString()}
+                {key.last_used_at && ` · last used ${new Date(key.last_used_at).toLocaleDateString()}`}
                 {key.expires_at && ` · expires ${new Date(key.expires_at).toLocaleDateString()}`}
+                {key.revoked && key.revoked_at && ` · revoked ${new Date(key.revoked_at).toLocaleDateString()}`}
               </div>
               {key.scopes && (
                 <div style={{ fontSize: 12, marginTop: 4 }}>

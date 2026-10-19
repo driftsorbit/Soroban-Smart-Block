@@ -351,6 +351,83 @@ export default function registerAdminRoutes(app) {
     catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // ── Manual replay and repair audit trail (#1118) ──────────────────────────
+  router.post("/repair", async (req, res) => {
+    try {
+      const {
+        action,
+        range_from,
+        range_to,
+        reason,
+        dry_run = false,
+        details = {},
+      } = req.body || {};
+
+      if (!action || typeof action !== "string" || !action.trim()) {
+        return res.status(400).json({ error: "action is required" });
+      }
+
+      if (!reason || typeof reason !== "string" || !reason.trim()) {
+        return res.status(400).json({ error: "reason is required for manual replay and repair jobs" });
+      }
+
+      const actor = req.admin?.sub || req.admin?.user || req.headers["x-admin-actor"] || "admin";
+      const isDryRun = Boolean(dry_run);
+
+      const auditRecord = await db.recordRepairAudit({
+        action: action.trim(),
+        actor,
+        range_from: range_from !== undefined && range_from !== null ? parseInt(range_from, 10) : null,
+        range_to: range_to !== undefined && range_to !== null ? parseInt(range_to, 10) : null,
+        reason: reason.trim(),
+        dry_run: isDryRun,
+        status: isDryRun ? "completed" : "running",
+        details: {
+          ...details,
+          executed_at: new Date().toISOString(),
+          dry_run: isDryRun,
+        },
+        completed_at: isDryRun ? new Date().toISOString() : null,
+      });
+
+      return res.status(201).json({
+        ok: true,
+        job_id: auditRecord.id,
+        audit: auditRecord,
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.get("/repair/audit", async (req, res) => {
+    try {
+      const { limit, offset, action, actor, status } = req.query;
+      const result = await db.listRepairAudit({
+        limit,
+        offset,
+        action,
+        actor,
+        status,
+      });
+      return res.json(result);
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.get("/repair/audit/:id", async (req, res) => {
+    try {
+      const record = await db.getRepairAuditById(req.params.id);
+      if (!record) {
+        return res.status(404).json({ error: "Repair audit record not found" });
+      }
+      return res.json(record);
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── GET /api/admin/api-keys ────────────────────────────────────────────────
   router.get("/api-keys", async (req, res) => {
     try {

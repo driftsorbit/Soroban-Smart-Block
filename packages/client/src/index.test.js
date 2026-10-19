@@ -298,4 +298,86 @@ describe("@soroban-explorer/client", () => {
       await assert.rejects(() => client.events(), /Bad Gateway/);
     });
   });
+
+  describe("timeouts and cancellation (#1083)", () => {
+    it("should support AbortSignal cancellation", async () => {
+      const controller = new AbortController();
+      controller.abort("manual abort");
+
+      const fetch = async (_url, init) => {
+        if (init?.signal?.aborted) throw init.signal.reason;
+        return { ok: true, status: 200, headers: new Map(), json: async () => ({}) };
+      };
+
+      const client = createClient({ fetch });
+      await assert.rejects(() => client.events({ signal: controller.signal }), (err) => {
+        return err === "manual abort" || String(err).includes("manual abort") || String(err).includes("aborted");
+      });
+    });
+
+    it("should enforce per-request timeouts", async () => {
+      const fetch = (_url, init) =>
+        new Promise((_, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new Error("Request timeout"));
+          });
+        });
+
+      const client = createClient({ fetch, timeout: 20 });
+      await assert.rejects(() => client.events(), /Request timeout/);
+    });
+  });
+
+  describe("retry and backoff policies (#1082)", () => {
+    it("should retry retryable read on 503 and succeed on subsequent attempt", async () => {
+      let attempts = 0;
+      const fetch = async () => {
+        attempts++;
+        if (attempts === 1) {
+          return {
+            ok: false,
+            status: 503,
+            headers: new Map([["content-type", "application/json"]]),
+            text: async () => JSON.stringify({ error: "Unavailable" }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: new Map([["content-type", "application/json"]]),
+          json: async () => ({ data: [{ seq: 1 }] }),
+        };
+      };
+
+      const client = createClient({
+        fetch,
+        retry: { maxRetries: 2, initialDelayMs: 10, jitter: false },
+      });
+
+      const res = await client.events();
+      assert.equal(attempts, 2);
+      assert.equal(res.data.length, 1);
+    });
+
+    it("should bound retries to maxRetries on persistent 500 error", async () => {
+      let attempts = 0;
+      const fetch = async () => {
+        attempts++;
+        return {
+          ok: false,
+          status: 500,
+          headers: new Map([["content-type", "application/json"]]),
+          text: async () => JSON.stringify({ error: "Internal Error" }),
+        };
+      };
+
+      const client = createClient({
+        fetch,
+        retry: { maxRetries: 2, initialDelayMs: 10, jitter: false },
+      });
+
+      await assert.rejects(() => client.events(), /Internal Error/);
+      assert.equal(attempts, 3); // initial (1) + 2 retries
+    });
+  });
 });

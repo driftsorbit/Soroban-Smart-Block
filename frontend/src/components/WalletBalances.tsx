@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api";
 import { resolveAssetLogo } from "../utils/assetLogo";
 import { truncateAddress } from "../utils/strkey";
+import { DEFAULT_DUST_THRESHOLD, parseDustThreshold, partitionByDust } from "../utils/dustFilter";
 
 interface Props {
   address: string;
@@ -57,6 +58,11 @@ function AssetLogo({ code, issuer }: { code: string; issuer: string | null }) {
  * caller's event history can still load (issue #529).
  */
 export default function WalletBalances({ address }: Props) {
+  // Dust filtering is opt-in (#1045). The full list stays one click away.
+  const [hideDust, setHideDust] = useState(false);
+  const [thresholdInput, setThresholdInput] = useState(DEFAULT_DUST_THRESHOLD);
+  const threshold = useMemo(() => parseDustThreshold(thresholdInput), [thresholdInput]);
+
   const { data, isLoading, error } = useQuery({
     queryKey: ["walletBalances", address],
     queryFn: () => api.wallet(address).then((r) => r.horizon_account?.balances ?? []),
@@ -80,8 +86,12 @@ export default function WalletBalances({ address }: Props) {
   }
 
   const xlm = data?.xlm ?? null;
-  const assets = data?.assets ?? [];
+  const allAssets = data?.assets ?? [];
   const xlmBalance = xlm?.balance ?? "0";
+  const filterActive = hideDust && threshold.ok;
+  const { visible: assets, dust: hiddenDust } = filterActive
+    ? partitionByDust(allAssets, threshold.value)
+    : { visible: allAssets, dust: [] };
 
   return (
     <div>
@@ -89,6 +99,40 @@ export default function WalletBalances({ address }: Props) {
       <div style={{ fontSize: 30, fontWeight: 700, marginTop: 2 }}>
         {formatAmount(xlmBalance)} <span style={{ fontSize: 15, color: "var(--muted)" }}>XLM</span>
       </div>
+
+      {allAssets.length > 0 && (
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginTop: 16, fontSize: 13 }}>
+          <label style={{ display: "inline-flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
+            <input type="checkbox" checked={hideDust} onChange={(e) => setHideDust(e.target.checked)} />
+            Hide possible dust
+          </label>
+          <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+            Below
+            <input
+              type="text"
+              inputMode="decimal"
+              aria-label="Dust threshold in asset units"
+              aria-invalid={!threshold.ok}
+              value={thresholdInput}
+              onChange={(e) => setThresholdInput(e.target.value)}
+              disabled={!hideDust}
+              style={{ width: 90, padding: "2px 6px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--surface)", color: "var(--text)" }}
+            />
+            units
+          </label>
+          {hideDust && !threshold.ok && (
+            <span role="alert" style={{ color: "#f85149" }}>{threshold.error} Showing all balances.</span>
+          )}
+          {filterActive && (
+            <span style={{ color: "var(--muted)" }}>
+              {hiddenDust.length} balance{hiddenDust.length !== 1 ? "s" : ""} hidden as possible dust.{" "}
+              <button type="button" onClick={() => setHideDust(false)} style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", padding: 0 }}>
+                Show all
+              </button>
+            </span>
+          )}
+        </div>
+      )}
 
       {assets.length > 0 && (
         <div style={{ overflowX: "auto", marginTop: 16 }}>

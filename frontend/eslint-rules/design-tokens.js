@@ -12,7 +12,7 @@
  * - Storybook files
  */
 
-module.exports = {
+export default {
   meta: {
     type: "suggestion",
     docs: {
@@ -65,14 +65,15 @@ module.exports = {
     const pixelSpacingRegex = /\b\d+px\b/g;
     const remSpacingRegex = /\b\d+rem\b/g;
     const emSpacingRegex = /\b\d+em\b/g;
-    const hardcodedFontRegex = /font-family:\s*[^;]+(?![^;]*var\(--font-))/g;
-    const hardcodedRadiusRegex = /border-radius:\s*[^;]+(?![^;]*var\(--radius-))/g;
+    const hardcodedFontRegex = /font-family:\s*[^;]+(?![^;]*var\(--font-)/g;
+    const hardcodedRadiusRegex = /border-radius:\s*[^;]+(?![^;]*var\(--radius-)/g;
 
     function checkStyleObject(node) {
       if (node.type !== "ObjectExpression") return;
 
       node.properties.forEach((property) => {
-        if (property.value.type !== "Literal") return;
+        // Spread elements (`...base`) have no value node to check.
+        if (!property.value || property.value.type !== "Literal") return;
         const value = property.value.value;
 
         if (typeof value !== "string") return;

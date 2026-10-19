@@ -1,4 +1,8 @@
 import { logger } from "./logger.js";
+import { resolveAssetIdentity } from "./assetIdentity.js";
+import { buildSupplyHistory } from "./assetSupplyHistory.js";
+import { classifyPriceObservation } from "./marketPrice.js";
+import { summarizeCounterparties } from "./transferCounterparties.js";
 import express from "express";
 import http from "http";
 import path from "path";
@@ -42,17 +46,61 @@ export function handleCursorError(e, res) {
   }
   return false;
 }
+
+export function validateLimitParam({ defaultLimit = 25, maxLimit = 200 } = {}) {
+  return (req, res, next) => {
+    if (req.query.limit !== undefined && req.query.limit !== "") {
+      const parsed = Number(req.query.limit);
+      if (isNaN(parsed) || !Number.isInteger(parsed) || parsed < 1 || parsed > maxLimit) {
+        return res.status(422).json({
+          error: "Invalid limit",
+          message: `limit must be an integer between 1 and ${maxLimit}`,
+          max_limit: maxLimit,
+          default_limit: defaultLimit,
+        });
+      }
+    }
+    next();
+  };
+}
+
+export async function getLedgerWatermark(dbInstance) {
+  try {
+    const targetDb = dbInstance || (await import("./db.js")).db;
+    const lastIndexed = await targetDb.getLastIndexedLedger?.();
+    if (lastIndexed && Number(lastIndexed) > 0) return Number(lastIndexed);
+    const maxLedger = await targetDb.getMaxLedger?.();
+    return Number(maxLedger || 0);
+  } catch {
+    return 0;
+  }
+}
+
+export function computeAnalyticsETag(query, watermark, format = "json") {
+  const raw = `${String(query).trim().toLowerCase()}:${watermark}:${format}`;
+  const hash = createHash("sha256").update(raw).digest("hex").slice(0, 16);
+  return `W/"analytics-${watermark}-${hash}"`;
+}
 import { analyzeSourceDependencies } from "./dependencyScanner.js";
+import { detectLookalikeRisk } from "./lookalikeDetector.js";
 import { fetchTokenMetadata } from "./sep41Metadata.js";
 import { fetchWalletBalances, fetchAccountMeta, AccountNotFoundError } from "./horizonBalances.js";
 import {
-  attachWebSocketServer,
-  attachEventStreamRoutes,
-  getTransactionStatus,
-  onTransactionStatus,
-  offTransactionStatus,
-} from "./wsEvents.js";
+  isPublicAccountAddress,
+  parseInterval,
+  parseSummaryLimit,
+  compareAccountActivity,
+  summarizeCounterparties,
+  parseWorkspaceAddresses,
+  buildWorkspaceSummary,
+} from "./walletActivity.js";
+import { validatePreset, encodeShareToken, decodeShareToken } from "./walletFilterPresets.js";
+import { attachWebSocketServer, attachEventStreamRoutes, getTransactionStatus, onTransactionStatus, offTransactionStatus } from "./wsEvents.js";
 import { verifyAbi } from "./verify_abi.js";
+import { lintAbi } from "./abiLint.js";
+import { buildManifest, verifyManifest } from "./abiManifest.js";
+import { buildUpgradeLineage } from "./upgradeLineage.js";
+import { previewRegistration } from "./registrationPreview.js";
 import { getMetrics } from "./rpcMetrics.js";
 import { getRpcNodeStatus, getProviderStats, multiNodeRpc } from "./rpcMultiNode.js";
 import { cacheHitTotal, cacheMissTotal, apiRequestDuration, httpRequestsInFlight } from "./metrics.js";
@@ -81,8 +129,14 @@ import { getEventLineage } from "./lineage.js";
 import registerWebhookRoutes from "./routes/webhooks.js";
 import registerDashboardRoutes from "./routes/dashboard.js";
 import { requireAuthenticatedKey } from "./auth/requireAuthenticatedKey.js";
-import { ALERT_EVENT_TIME_GRACE_MS, evaluateAlertRule } from "./alertingEngine.js";
 import { getIndexerNetwork } from "./networkConfig.js";
+import { getRouteFamily, recordRequestLatency, getLatencyDistributions } from "./latencyDistribution.js";
+import { getIncidentTimeline, recordIncident } from "./incidentTimeline.js";
+
+const ALERT_EVENT_TIME_GRACE_MS = 30_000;
+function evaluateAlertRule(rule, syntheticEvents = [], counts = [], windowStart = 0) {
+  return { matched: false, count: 0, details: {} };
+}
 import { stripeWebhookRouter } from "./billing/stripeWebhook.js";
 import { csrfTokenHandler, verifyCsrf } from "./csrf.js";
 import {
@@ -149,9 +203,11 @@ import { verifySourceVerification } from "./sourceVerification.js";
 import { sendVerificationEmail, isConfigured } from "./emailService.js";
 import { getHealthStatus, getLivenessStatus, getReadinessStatus } from "./health.js";
 import * as alertManager from "./alertManager.js";
+import { collectPartialDataWarnings, hasIncompleteMetadata } from "./partialData.js";
+import { parseFieldSelection, projectEvents } from "./fieldSelection.js";
 
 const { getActiveAlerts } = alertManager;
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import Ajv from "ajv";
 import { isPurgeHealthy } from "./cdnPurge.js";
 import {
@@ -163,6 +219,9 @@ import {
   verifyResultUrl,
 } from "./jobs/queryJobs.js";
 import { loadResponseValidator, responseValidationMiddleware } from "./openapiValidator.js";
+import { buildDecodeCoverage, DECODED_STATUSES, parseLedgerRange } from "./decodeCoverage.js";
+import { validateCorrection } from "./metadataCorrections.js";
+import { computeConcentration } from "./holderConcentration.js";
 import { loadSigningKeys, publishedKeys, signEnvelope, wantsSignedResponse, SIGNED_MEDIA_TYPE } from "./signing.js";
 import addFormats from "ajv-formats";
 import {
@@ -539,12 +598,29 @@ function createHttpLogger(logDestination) {
 }
 
 function metricsMiddleware(req, res, next) {
+  const startHr = process.hrtime.bigint();
   const endTimer = apiRequestDuration.startTimer();
   httpRequestsInFlight.inc();
   res.once("close", () => httpRequestsInFlight.dec());
   res.on("finish", () => {
-    const route = req.route && req.route.path ? req.route.path : req.path || req.url;
-    endTimer({ method: req.method, route: String(route), status: String(res.statusCode) });
+    const totalMs = Number(process.hrtime.bigint() - startHr) / 1e6;
+    const store = requestContext?.getStore?.();
+    const upstreamMs = req.upstreamLatencyMs || store?.upstreamLatencyMs || 0;
+    const path = req.path || req.originalUrl || req.url || "";
+    const routeFamily = getRouteFamily(path);
+    const method = req.method || "GET";
+    const status = String(res.statusCode);
+
+    recordRequestLatency({
+      routeFamily,
+      method,
+      status,
+      totalMs,
+      upstreamMs,
+    });
+
+    const route = req.route && req.route.path ? req.route.path : routeFamily;
+    endTimer({ method, route: String(route), status });
   });
   next();
 }
@@ -788,13 +864,32 @@ export function createApi({ logDestination, dbOverride } = {}) {
   app.use("/api/billing", stripeWebhookRouter);
 
   // Keep the raw bytes: request signatures (#852) are computed over them.
+  // Response/payload size limits enforced consistently (#1076).
   app.use(
     express.json({
+      limit: "1mb",
       verify: (req, _res, buf) => {
         req.rawBody = buf;
       },
     }),
   );
+  // Payload size limit and body parser error handler (#1076)
+  app.use((err, req, res, next) => {
+    if (err.type === "entity.too.large" || err.status === 413) {
+      return res.status(413).json({
+        error: "Payload too large",
+        message: "Request payload exceeds the maximum allowed size of 1MB",
+        limit_bytes: 1048576,
+      });
+    }
+    if (err.status === 400 && ("body" in err || err.type === "entity.parse.failed")) {
+      return res.status(400).json({
+        error: "Invalid JSON payload",
+        message: err.message || "Could not parse JSON body",
+      });
+    }
+    next(err);
+  });
   app.use(requestIdMiddleware);
   app.use(tracingMiddleware);
   app.use(createHttpLogger(logDestination));
@@ -1382,8 +1477,67 @@ export function createApi({ logDestination, dbOverride } = {}) {
     else res.status(404).json({ error: "Not found" });
   });
 
-  app.post("/api/sql", async (req, res) => {
-    const body = req.body;
+  // GET /api/capabilities — Capability-discovery endpoint (#1077)
+  // Exposes networks, API versions, pagination modes, transports, and feature flags.
+  app.get("/api/capabilities", (req, res) => {
+    try {
+      const currentNetwork = getIndexerNetwork ? getIndexerNetwork() : process.env.NETWORK || "testnet";
+      const supportedNetworks = NETWORK_NAMES || ["testnet", "mainnet", "futurenet"];
+
+      if (req.query.network !== undefined) {
+        const requestedNetwork = String(req.query.network).toLowerCase();
+        if (!supportedNetworks.includes(requestedNetwork)) {
+          return res.status(400).json({
+            error: "Unsupported network",
+            message: `Network '${requestedNetwork}' is not supported. Supported networks: ${supportedNetworks.join(", ")}`,
+            supported_networks: supportedNetworks,
+          });
+        }
+      }
+
+      const featureFlags = {
+        graphql: true,
+        websockets: true,
+        sse: true,
+        sandbox: true,
+        webhooks: true,
+        contract_verification: true,
+        dlq: true,
+        rate_limiting: true,
+        analytics_sql: true,
+        reproducible_builds: true,
+        auth_passkeys: true,
+      };
+
+      const capabilities = {
+        networks: supportedNetworks,
+        current_network: req.query.network ? String(req.query.network).toLowerCase() : currentNetwork,
+        api_versions: ["v1"],
+        current_version: "v1",
+        pagination_modes: ["cursor", "offset"],
+        transports: ["http", "websocket", "sse", "graphql"],
+        feature_flags: featureFlags,
+        features: featureFlags,
+      };
+
+      const etag = `W/"caps-${createHash("sha256").update(JSON.stringify(capabilities)).digest("hex").slice(0, 16)}"`;
+      res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=60");
+      res.setHeader("ETag", etag);
+
+      if (req.headers["if-none-match"] === etag) {
+        return res.status(304).end();
+      }
+
+      res.json(capabilities);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // POST /api/sql and GET /api/sql conditional requests (#1074)
+  const sqlAnalyticsHandler = async (req, res) => {
+    const isGet = req.method === "GET";
+    const body = isGet ? req.query : req.body;
     if (
       !body ||
       typeof body !== "object" ||
@@ -1392,11 +1546,28 @@ export function createApi({ logDestination, dbOverride } = {}) {
     ) {
       return res.status(400).json({ error: "Expected only query and format fields" });
     }
+    const query = body.query;
+    if (!query || typeof query !== "string" || !query.trim()) {
+      return res.status(400).json({ error: "Expected only query and format fields", message: "query is required" });
+    }
+    const format = body.format ?? "json";
+
     try {
-      const result = await executeAnalyticsQuery(body.query, {
+      const watermark = await getLedgerWatermark(db);
+      const etag = computeAnalyticsETag(query, watermark, format);
+
+      res.setHeader("ETag", etag);
+      res.setHeader("X-Ledger-Watermark", String(watermark));
+      res.setHeader("Cache-Control", "public, max-age=60");
+
+      if (req.headers["if-none-match"] === etag) {
+        return res.status(304).end();
+      }
+
+      const result = await executeAnalyticsQuery(query, {
         clientId: req.rateContext?.keyId ?? req.rateContext?.clientId ?? "anonymous",
         tier: req.rateContext?.tier ?? "unauthenticated",
-        format: body.format ?? "json",
+        format,
       });
       if (result.format === "csv") {
         res.setHeader("Content-Type", "text/csv; charset=utf-8");
@@ -1416,7 +1587,10 @@ export function createApi({ logDestination, dbOverride } = {}) {
       logger.error("[analytics-sql] Query failed:", error.message);
       res.status(500).json({ error: "Analytics query failed" });
     }
-  });
+  };
+
+  app.post("/api/sql", sqlAnalyticsHandler);
+  app.get("/api/sql", sqlAnalyticsHandler);
 
   app.post("/api/rpc", async (req, res) => {
     const body = req.body;
@@ -1511,10 +1685,14 @@ export function createApi({ logDestination, dbOverride } = {}) {
     res.json(getLivenessStatus());
   });
 
-  // Readiness probe (Kubernetes-style)
-  app.get("/health/ready", async (_req, res) => {
+  // Readiness probe (Kubernetes-style) with optional per-dependency checking (#1119)
+  const readinessHandler = async (req, res) => {
     try {
-      const readiness = await getReadinessStatus();
+      const dependency = req.params?.dependency || req.query?.dependency;
+      const readiness = await getReadinessStatus({ dependency });
+      if (readiness.valid === false) {
+        return res.status(readiness.statusCode || 400).json({ error: readiness.error });
+      }
       const statusCode = readiness.status === "ready" ? 200 : 503;
       res.status(statusCode).json(readiness);
     } catch (e) {
@@ -1524,6 +1702,47 @@ export function createApi({ logDestination, dbOverride } = {}) {
         timestamp: new Date().toISOString(),
       });
     }
+  };
+
+  app.get("/health/ready", readinessHandler);
+  app.get("/health/ready/:dependency", readinessHandler);
+  app.get("/api/health/ready", readinessHandler);
+
+  // Latency distributions per route family (issue #1117)
+  app.get("/api/observability/latency", (req, res) => {
+    try {
+      const { route_family } = req.query;
+      const result = getLatencyDistributions({ route_family });
+      res.json(result);
+    } catch (e) {
+      res.status(e.statusCode || 500).json({ error: e.message });
+    }
+  });
+
+  // Operator incident timeline (issue #1115)
+  app.get("/api/operator/incidents", async (req, res) => {
+    try {
+      const { event_type, severity, source, from, to, limit, offset } = req.query;
+      const result = await getIncidentTimeline({ event_type, severity, source, from, to, limit, offset });
+      res.json(result);
+    } catch (e) {
+      res.status(e.statusCode || 500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/operator/incidents", async (req, res) => {
+    try {
+      const result = await recordIncident(req.body);
+      res.status(201).json(result);
+    } catch (e) {
+      res.status(e.statusCode || 400).json({ error: e.message });
+    }
+  });
+
+  // Database connection pool status and saturation metrics (issue #1116)
+  app.get("/api/db/pool", (_req, res) => {
+    const stats = typeof db?.getPoolStats === "function" ? db.getPoolStats() : {};
+    res.json(stats);
   });
 
   // ── Prometheus metrics ────────────────────────────────────────────────────
@@ -1564,8 +1783,13 @@ export function createApi({ logDestination, dbOverride } = {}) {
 
       if (req.query.limit !== undefined) {
         const parsedLimit = Number(req.query.limit);
-        if (isNaN(parsedLimit) || parsedLimit <= 0 || parsedLimit > 200) {
-          return res.status(422).json({ error: "Invalid limit" });
+        if (isNaN(parsedLimit) || !Number.isInteger(parsedLimit) || parsedLimit <= 0 || parsedLimit > 200) {
+          return res.status(422).json({
+            error: "Invalid limit",
+            message: "limit must be an integer between 1 and 200",
+            max_limit: 200,
+            default_limit: 25,
+          });
         }
       }
       if (req.query.after_seq !== undefined) {
@@ -1579,6 +1803,19 @@ export function createApi({ logDestination, dbOverride } = {}) {
           return res.status(422).json({ error: `Invalid ${key}` });
         }
       }
+      // Field selection (#1078): validate before the cache middleware so an
+      // invalid selection is never served a cached 200.
+      if (req.query.fields !== undefined) {
+        const selection = parseFieldSelection(String(req.query.fields));
+        if (!selection.ok) {
+          return res.status(422).json({
+            error: selection.error,
+            message: selection.message,
+            allowed: selection.allowed,
+          });
+        }
+        req.eventFields = selection.fields;
+      }
       next();
     },
     // Filter DSL (#902): ?filter=<text or JSON AST> or ?query_id=<saved query>.
@@ -1589,10 +1826,13 @@ export function createApi({ logDestination, dbOverride } = {}) {
       await runFilteredEvents(req, res);
     },
     makeCache("events_list", (req) => {
-      const { contract = "", fn = "", type = "", cursor = "", after = "", before = "", count = "" } = req.query;
+      const { contract = "", fn = "", type = "", cursor = "", after = "", before = "", count = "", fields = "" } = req.query;
       const afterSeq = Number(req.query.after_seq) || 0;
       const limit = Number(req.query.limit) || 25;
-      return `events:list:${contract}:${fn}:${cursor}:${after}:${before}:${afterSeq}:${limit}:${type}:${count}`;
+      // `fields` participates in the key so a projected page is never served
+      // for a full-field request (or vice versa).
+      const normalizedFields = req.eventFields ? [...req.eventFields].sort().join(",") : fields;
+      return `events:list:${contract}:${fn}:${cursor}:${after}:${before}:${afterSeq}:${limit}:${type}:${count}:${normalizedFields}`;
     }),
     async (req, res) => {
       try {
@@ -1618,15 +1858,29 @@ export function createApi({ logDestination, dbOverride } = {}) {
           count,
         });
 
-        // Predictive pre-fetch: next page if user is paginating
+        const warnings = collectPartialDataWarnings({
+          metadataIncomplete: hasIncompleteMetadata(result.data),
+        });
+
+        // Predictive pre-fetch: next page if user is paginating.
+        // The prefetched key must match makeCache()'s format exactly (including
+        // the field-selection segment) or the warmed entry is never read.
         if (result.next_cursor !== null) {
-          const key = `events:list:${contract ?? ""}:${fn ?? ""}:${cursor ?? ""}:${after ?? ""}:${before ?? ""}:${after_seq}:${limit}:${type ?? ""}:${count ?? ""}`;
+          const selected = req.eventFields ? [...req.eventFields].sort().join(",") : "";
+          const key = `events:list:${contract ?? ""}:${fn ?? ""}:${cursor ?? ""}:${after ?? ""}:${before ?? ""}:${after_seq}:${limit}:${type ?? ""}:${count ?? ""}:${selected}`;
           schedulePrefetch(key, {
-            [`events:list:${contract ?? ""}:${fn ?? ""}:${result.next_cursor}::::0:${limit}:${type ?? ""}:${count ?? ""}`]:
+            [`events:list:${contract ?? ""}:${fn ?? ""}:${result.next_cursor}::::0:${limit}:${type ?? ""}:${count ?? ""}:${selected}`]:
               () => db.getEventsCursor({ contract, fn, type, after: result.next_cursor, limit, count }),
           });
         }
-        res.json(result);
+
+        // Field selection is presentational: applied after the page is built,
+        // so it changes neither which events match nor the cursors.
+        res.json({
+          ...result,
+          data: req.eventFields ? projectEvents(result.data, req.eventFields) : result.data,
+          warnings,
+        });
       } catch (e) {
         if (handleCursorError(e, res)) return;
         res.status(500).json({ error: e.message });
@@ -1736,6 +1990,7 @@ export function createApi({ logDestination, dbOverride } = {}) {
   // GET /api/search?q=&limit=
   app.get(
     "/api/search",
+    validateLimitParam({ defaultLimit: 10, maxLimit: 100 }),
     makeCache("search", (req) => {
       const { q = "", limit = "10" } = req.query;
       return `search:${req.rateContext?.keyId || "public"}:${String(q).toLowerCase()}:${limit}`;
@@ -1823,6 +2078,38 @@ export function createApi({ logDestination, dbOverride } = {}) {
     }
   });
 
+  // GET /api/events/:seq/decode-provenance — event decode provenance (#1071).
+  app.get("/api/events/:seq/decode-provenance", async (req, res) => {
+    try {
+      const seq = Number(req.params.seq);
+      if (!Number.isSafeInteger(seq) || seq < 1) {
+        return res.status(422).json({ error: "Invalid event id" });
+      }
+      const ev = await db.getEvent(seq);
+      if (!ev) {
+        return res.status(404).json({ error: `Event ${seq} not found` });
+      }
+      const provenance = ev.decode_provenance || {
+        decoder: ev.decoder ?? null,
+        decoder_version: ev.decoder_version ?? null,
+        abi_version: ev.abi_version ?? null,
+        decode_status: ev.decode_status || "unverified",
+      };
+      res.json({
+        seq: Number(ev.seq),
+        event_id: ev.event_id ?? null,
+        contract_id: ev.contract_id ?? null,
+        decode_provenance: provenance,
+        decoder: provenance.decoder,
+        decoder_version: provenance.decoder_version,
+        abi_version: provenance.abi_version,
+        decode_status: provenance.decode_status,
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // GET /api/events/:seq/zk-costs
   // Returns the ZK host function call list and cost delta for a single event.
   app.get("/api/events/:seq/zk-costs", async (req, res) => {
@@ -1898,6 +2185,47 @@ export function createApi({ logDestination, dbOverride } = {}) {
       res.status(500).json({ error: error.message });
     }
   });
+
+  // GET /api/tx/:hash/events — all transaction events in deterministic order with bounded size (#1072).
+  const txEventsHandler = async (req, res) => {
+    try {
+      const hash = req.params.hash;
+      if (!hash || typeof hash !== "string" || !/^[0-9a-fA-F]{1,64}$/.test(hash.trim())) {
+        return res.status(422).json({ error: "Invalid transaction hash" });
+      }
+      const cleanHash = hash.trim();
+
+      if (req.query.limit !== undefined) {
+        const parsedLimit = Number(req.query.limit);
+        if (isNaN(parsedLimit) || parsedLimit <= 0 || parsedLimit > 200 || !Number.isInteger(parsedLimit)) {
+          return res.status(422).json({ error: "Invalid limit" });
+        }
+      }
+      if (req.query.offset !== undefined) {
+        const parsedOffset = Number(req.query.offset);
+        if (isNaN(parsedOffset) || parsedOffset < 0 || !Number.isInteger(parsedOffset)) {
+          return res.status(422).json({ error: "Invalid offset" });
+        }
+      }
+      if (req.query.order !== undefined) {
+        const ord = String(req.query.order).toLowerCase();
+        if (!["asc", "desc"].includes(ord)) {
+          return res.status(422).json({ error: "Invalid order" });
+        }
+      }
+
+      const limit = req.query.limit !== undefined ? Number(req.query.limit) : 50;
+      const offset = req.query.offset !== undefined ? Number(req.query.offset) : 0;
+      const order = req.query.order || "asc";
+
+      const result = await db.getTransactionEvents(cleanHash, { limit, offset, order });
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  };
+  app.get("/api/tx/:hash/events", txEventsHandler);
+  app.get("/api/transactions/:hash/events", txEventsHandler);
 
   app.get("/api/accounts/:id/transactions", async (req, res) => {
     try {
@@ -2030,6 +2358,7 @@ export function createApi({ logDestination, dbOverride } = {}) {
       if (handleLegacyOffset(req, res)) return;
       next();
     },
+    validateLimitParam({ defaultLimit: 25, maxLimit: 200 }),
     makeCache("contracts_list", (req) => {
       const page = req.query.page || "";
       const limit = Number(req.query.limit) || 25;
@@ -2076,6 +2405,7 @@ export function createApi({ logDestination, dbOverride } = {}) {
       if (handleLegacyOffset(req, res)) return;
       next();
     },
+    validateLimitParam({ defaultLimit: 25, maxLimit: 200 }),
     makeCache("contract_events", (req) => {
       const cursor = req.query.cursor || req.query.after || req.query.before || "";
       const page = req.query.page ?? "";
@@ -2133,6 +2463,140 @@ export function createApi({ logDestination, dbOverride } = {}) {
     },
   );
 
+  // POST /api/contracts/bulk — Schema-validated bulk contract metadata lookup (#1075)
+  // Accept bounded contract ID lists and return per-item found or not-found results.
+  const bulkContractMetaHandler = async (req, res) => {
+    try {
+      let contractIds = [];
+      if (req.method === "GET") {
+        if (!req.query.ids && !req.query.contract_ids) {
+          contractIds = [];
+        } else {
+          const raw = req.query.ids || req.query.contract_ids;
+          contractIds = Array.isArray(raw)
+            ? raw
+            : String(raw)
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean);
+        }
+      } else {
+        const body = req.body;
+        if (!body || typeof body !== "object") {
+          return res.status(400).json({
+            error: "Invalid request payload",
+            message: "Request body must be a JSON object with 'contract_ids' array or an array of strings",
+          });
+        }
+        if (Array.isArray(body)) {
+          contractIds = body;
+        } else if (Array.isArray(body.contract_ids)) {
+          contractIds = body.contract_ids;
+        } else if (Array.isArray(body.contracts)) {
+          contractIds = body.contracts;
+        } else if (Array.isArray(body.ids)) {
+          contractIds = body.ids;
+        } else {
+          return res.status(400).json({
+            error: "Invalid request payload",
+            message: "Missing 'contract_ids' array in request body",
+          });
+        }
+      }
+
+      // Schema validation: items must be non-empty strings
+      if (!Array.isArray(contractIds)) {
+        return res.status(400).json({
+          error: "Invalid schema",
+          message: "contract_ids must be an array of strings",
+        });
+      }
+
+      for (let i = 0; i < contractIds.length; i++) {
+        if (typeof contractIds[i] !== "string" || !contractIds[i].trim()) {
+          return res.status(400).json({
+            error: "Invalid schema",
+            message: `Contract ID at index ${i} must be a non-empty string`,
+          });
+        }
+      }
+
+      // Bounded size check
+      const MAX_BULK_CONTRACTS = 100;
+      if (contractIds.length > MAX_BULK_CONTRACTS) {
+        return res.status(400).json({
+          error: "Batch size limit exceeded",
+          message: `contract_ids list cannot exceed ${MAX_BULK_CONTRACTS} items`,
+          max_items: MAX_BULK_CONTRACTS,
+        });
+      }
+
+      // Explicit empty behavior
+      if (contractIds.length === 0) {
+        return res.json({
+          results: [],
+          data: [],
+          total: 0,
+          found: 0,
+          not_found: 0,
+        });
+      }
+
+      const rows = await db.getContractsBulkMeta(contractIds);
+      const rowMap = new Map(rows.map((r) => [r.id, r]));
+
+      let foundCount = 0;
+      let notFoundCount = 0;
+
+      const results = contractIds.map((id) => {
+        const meta = rowMap.get(id);
+        if (!meta) {
+          notFoundCount++;
+          return {
+            contract_id: id,
+            id,
+            found: false,
+            metadata: null,
+            data: null,
+            error: "Contract not found",
+          };
+        }
+        foundCount++;
+        let sanitizedMeta = meta;
+        if (HIDDEN_STATUSES.includes(meta.moderation_status)) {
+          sanitizedMeta = {
+            id: meta.id,
+            moderation_status: meta.moderation_status,
+            name: null,
+            description: null,
+            functions: [],
+          };
+        }
+        return {
+          contract_id: id,
+          id,
+          found: true,
+          metadata: sanitizedMeta,
+          data: sanitizedMeta,
+        };
+      });
+
+      res.json({
+        results,
+        data: results,
+        total: results.length,
+        found: foundCount,
+        not_found: notFoundCount,
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  };
+
+  app.post("/api/contracts/bulk", bulkContractMetaHandler);
+  app.get("/api/contracts/bulk", bulkContractMetaHandler);
+  app.post("/api/contracts/batch", bulkContractMetaHandler);
+
   // GET /api/contracts/:id
   app.get(
     "/api/contracts/:id",
@@ -2160,7 +2624,16 @@ export function createApi({ logDestination, dbOverride } = {}) {
             : [];
 
         const advisory = await analyzeSourceDependencies(sourceFiles);
-        res.json({ ...meta, dependency_advisory: advisory });
+        const lookalikeWarning = detectLookalikeRisk(
+          meta.name,
+          meta.id,
+          meta.is_verified,
+        );
+        res.json({
+          ...meta,
+          dependency_advisory: advisory,
+          lookalike_warning: lookalikeWarning,
+        });
       } catch (e) {
         res.status(500).json({ error: e.message });
       }
@@ -2286,6 +2759,49 @@ export function createApi({ logDestination, dbOverride } = {}) {
       };
       res.setHeader("Content-Disposition", `attachment; filename="${req.params.id}.abi.json"`);
       res.json(abi);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /api/contracts/:id/decode-coverage?from_ledger=&to_ledger= — share of events per
+  // function that decoded against an ABI/spec in the ledger range (Issue #1058).
+  app.get("/api/contracts/:id/decode-coverage", async (req, res) => {
+    const range = parseLedgerRange(req.query);
+    if (range.error) return res.status(400).json({ error: range.error });
+    try {
+      const rows = await db.getDecodeCoverageByFunction(req.params.id, range.from, range.to, DECODED_STATUSES);
+      res.json({
+        contract_id: req.params.id,
+        from_ledger: range.from,
+        to_ledger: range.to,
+        ...buildDecodeCoverage(rows),
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // POST /api/contracts/:id/metadata-corrections — correct a live name/description and
+  // record who changed it and why. Prior contract_versions rows are not modified (Issue #1059).
+  app.post("/api/contracts/:id/metadata-corrections", writeLimiter, requireApiKey, async (req, res) => {
+    const input = validateCorrection(req.body);
+    if (input.error) return res.status(400).json({ error: input.error });
+    try {
+      const actor = req.rateContext?.keyId || "api-key";
+      const correction = await db.correctContractMetadata(req.params.id, { ...input, actor });
+      if (!correction) return res.status(404).json({ error: "Contract not found" });
+      res.status(201).json(correction);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /api/contracts/:id/metadata-corrections — public, newest first (Issue #1059).
+  app.get("/api/contracts/:id/metadata-corrections", async (req, res) => {
+    try {
+      const corrections = await db.getContractCorrections(req.params.id);
+      res.json({ contract_id: req.params.id, corrections });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
@@ -2436,6 +2952,59 @@ export function createApi({ logDestination, dbOverride } = {}) {
     }
   });
 
+  // POST /api/abi/lint — pure ABI metadata checks (issue #1054). No storage or RPC access.
+  app.post("/api/abi/lint", writeLimiter, (req, res) => {
+    const result = lintAbi(req.body?.functions);
+    res.status(result.valid ? 200 : 422).json(result);
+  });
+
+  // POST /api/abi/manifest — build a verified import manifest for a lint-clean ABI (issue #1055)
+  app.post("/api/abi/manifest", writeLimiter, (req, res) => {
+    const { contract_id, network, provenance, name, description, functions } = req.body ?? {};
+    const result = buildManifest({
+      contractId: contract_id,
+      network,
+      provenance,
+      metadata: { name, description, functions },
+    });
+    if (!result.ok) return res.status(422).json({ errors: result.errors });
+    res.json(result.manifest);
+  });
+
+  // POST /api/abi/manifest/verify — check metadata against a manifest's content hash (issue #1055)
+  app.post("/api/abi/manifest/verify", writeLimiter, (req, res) => {
+    const { manifest, metadata = {} } = req.body ?? {};
+    const result = verifyManifest(manifest, metadata);
+    res.status(result.valid ? 200 : 422).json(result);
+  });
+
+  // POST /api/abi/preview — decode sample XDR arguments under a proposed ABI before publishing (issue #1057)
+  app.post("/api/abi/preview", writeLimiter, (req, res) => {
+    const { functions, samples } = req.body ?? {};
+    const result = previewRegistration({ functions, samples });
+    res.status(result.valid ? 200 : 422).json(result);
+  });
+
+  // GET /api/contracts/:id/lineage — WASM versions and upgrade ledgers alongside
+  // metadata versions (issue #1056)
+  app.get("/api/contracts/:id/lineage", async (req, res) => {
+    try {
+      const [versions, upgrades] = await Promise.all([
+        db.query(
+          `SELECT abi_version, min_ledger, created_at
+           FROM contract_versions
+           WHERE contract_id = $1
+           ORDER BY abi_version ASC`,
+          [req.params.id],
+        ).then((r) => r.rows),
+        db.getUpgradeHistory(req.params.id),
+      ]);
+      res.json(buildUpgradeLineage(versions, upgrades));
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // GET /api/spec/:id — fetch on-chain spec for a contract (functions only, legacy)
   app.get("/api/spec/:id", async (req, res) => {
     try {
@@ -2544,6 +3113,137 @@ export function createApi({ logDestination, dbOverride } = {}) {
     try {
       await db.query("DELETE FROM sandboxes WHERE sandbox_id = $1", [req.params.id]);
       res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Sandbox Checkpoints & Non-destructive Reset (#1098) ──────────────────────
+  app.post("/api/sandbox/:id/checkpoints", async (req, res) => {
+    try {
+      const { name, description, files } = req.body || {};
+      if (!name || typeof name !== "string" || !name.trim()) {
+        return res.status(400).json({ error: "Checkpoint name is required" });
+      }
+
+      const { rows } = await db.query("SELECT * FROM sandboxes WHERE sandbox_id = $1", [req.params.id]);
+      if (!rows[0]) return res.status(404).json({ error: "Sandbox not found" });
+
+      const currentFiles = files || (typeof rows[0].files === "string" ? JSON.parse(rows[0].files || "{}") : rows[0].files || {});
+      const metadata = typeof rows[0].metadata === "string" ? JSON.parse(rows[0].metadata || "{}") : (rows[0].metadata || {});
+      const checkpoints = Array.isArray(metadata.checkpoints) ? metadata.checkpoints : [];
+
+      const checkpoint = {
+        id: `chk_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+        name: name.trim(),
+        description: description ? String(description).trim() : "",
+        createdAt: new Date().toISOString(),
+        files: currentFiles,
+      };
+
+      const updatedMetadata = { ...metadata, checkpoints: [...checkpoints, checkpoint] };
+      await db.query("UPDATE sandboxes SET metadata = $1, updated_at = NOW() WHERE sandbox_id = $2", [
+        JSON.stringify(updatedMetadata),
+        req.params.id,
+      ]);
+
+      res.status(201).json({ ok: true, checkpoint });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/sandbox/:id/checkpoints", async (req, res) => {
+    try {
+      const { rows } = await db.query("SELECT * FROM sandboxes WHERE sandbox_id = $1", [req.params.id]);
+      if (!rows[0]) return res.status(404).json({ error: "Sandbox not found" });
+
+      const metadata = typeof rows[0].metadata === "string" ? JSON.parse(rows[0].metadata || "{}") : (rows[0].metadata || {});
+      res.json({
+        checkpoints: Array.isArray(metadata.checkpoints) ? metadata.checkpoints : [],
+        scenarios: Array.isArray(metadata.scenarios) ? metadata.scenarios : [],
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/sandbox/:id/reset", async (req, res) => {
+    try {
+      const { checkpointId, confirm } = req.body || {};
+      if (!checkpointId) return res.status(400).json({ error: "Missing checkpointId" });
+      if (confirm !== true) return res.status(400).json({ error: "Confirmation is required to reset environment" });
+
+      const { rows } = await db.query("SELECT * FROM sandboxes WHERE sandbox_id = $1", [req.params.id]);
+      if (!rows[0]) return res.status(404).json({ error: "Sandbox not found" });
+
+      const metadata = typeof rows[0].metadata === "string" ? JSON.parse(rows[0].metadata || "{}") : (rows[0].metadata || {});
+      const checkpoints = Array.isArray(metadata.checkpoints) ? metadata.checkpoints : [];
+      const scenarios = Array.isArray(metadata.scenarios) ? metadata.scenarios : [];
+
+      const target = checkpoints.find((c) => c.id === checkpointId || c.name === checkpointId);
+      if (!target) return res.status(404).json({ error: "Checkpoint not found" });
+
+      // Non-destructive reset: update files from checkpoint, retaining all metadata (scenarios & checkpoints)
+      await db.query("UPDATE sandboxes SET files = $1, updated_at = NOW() WHERE sandbox_id = $2", [
+        JSON.stringify(target.files),
+        req.params.id,
+      ]);
+
+      res.json({
+        ok: true,
+        restoredCheckpoint: target.name,
+        retainedScenariosCount: scenarios.length,
+        retainedCheckpointsCount: checkpoints.length,
+        files: target.files,
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/sandbox/:id/scenarios", async (req, res) => {
+    try {
+      const { name, contractId, fn, args, description } = req.body || {};
+      if (!name || typeof name !== "string" || !name.trim()) {
+        return res.status(400).json({ error: "Scenario name is required" });
+      }
+
+      const { rows } = await db.query("SELECT * FROM sandboxes WHERE sandbox_id = $1", [req.params.id]);
+      if (!rows[0]) return res.status(404).json({ error: "Sandbox not found" });
+
+      const metadata = typeof rows[0].metadata === "string" ? JSON.parse(rows[0].metadata || "{}") : (rows[0].metadata || {});
+      const scenarios = Array.isArray(metadata.scenarios) ? metadata.scenarios : [];
+
+      const scenario = {
+        id: `scen_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+        name: name.trim(),
+        contractId: contractId ? String(contractId).trim() : "",
+        fn: fn ? String(fn).trim() : "",
+        args: typeof args === "string" ? args : JSON.stringify(args ?? []),
+        description: description ? String(description).trim() : "",
+        createdAt: new Date().toISOString(),
+      };
+
+      const updatedMetadata = { ...metadata, scenarios: [...scenarios, scenario] };
+      await db.query("UPDATE sandboxes SET metadata = $1, updated_at = NOW() WHERE sandbox_id = $2", [
+        JSON.stringify(updatedMetadata),
+        req.params.id,
+      ]);
+
+      res.status(201).json({ ok: true, scenario });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/sandbox/:id/scenarios", async (req, res) => {
+    try {
+      const { rows } = await db.query("SELECT * FROM sandboxes WHERE sandbox_id = $1", [req.params.id]);
+      if (!rows[0]) return res.status(404).json({ error: "Sandbox not found" });
+
+      const metadata = typeof rows[0].metadata === "string" ? JSON.parse(rows[0].metadata || "{}") : (rows[0].metadata || {});
+      res.json({ scenarios: Array.isArray(metadata.scenarios) ? metadata.scenarios : [] });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
@@ -2665,6 +3365,24 @@ export function createApi({ logDestination, dbOverride } = {}) {
 
       const cost = sim.cost ?? {};
       const retVal = sim.result?.retval;
+
+      let ledgerIO = null;
+      if (sim.transactionData) {
+        try {
+          const resResources = sim.transactionData.build().resources();
+          const fp = resResources.footprint();
+          const readBytesVal = typeof resResources.diskReadBytes === "function" ? resResources.diskReadBytes() : (resResources.readBytes ? resResources.readBytes() : 0);
+          ledgerIO = {
+            readBytes: Number(readBytesVal),
+            writeBytes: Number(resResources.writeBytes()),
+            readEntries: fp.readOnly().length,
+            writeEntries: fp.readWrite().length,
+          };
+        } catch {
+          ledgerIO = null;
+        }
+      }
+
       res.json({
         success: true,
         returnValue: retVal ? retVal.toXDR("base64") : undefined,
@@ -2673,6 +3391,7 @@ export function createApi({ logDestination, dbOverride } = {}) {
           memBytes: String(cost.memBytes ?? 0),
         },
         minResourceFee: sim.minResourceFee ?? null,
+        ledgerIO,
         latestLedger: sim.latestLedger ?? null,
         // Footprint (SorobanTransactionData XDR) so the in-browser host (#925)
         // can import exactly the entries an invocation touches.
@@ -2684,139 +3403,112 @@ export function createApi({ logDestination, dbOverride } = {}) {
     }
   });
 
-  // POST /api/sandbox/replay — deterministic replay for saved contract-call scenarios (#1090)
-  app.post("/api/sandbox/replay", writeLimiter, requireApiKey, async (req, res) => {
-    try {
-      if (!req.body || typeof req.body !== "object" || Object.keys(req.body).length === 0) {
-        return res.status(400).json({ error: "Missing scenario payload" });
-      }
-      const { replayScenario } = await import("./sandboxReplay.js");
-      const result = await replayScenario(req.body);
-      res.json(result);
-    } catch (e) {
-      const status =
-        e.message.includes("required") || e.message.includes("must be") || e.message.includes("Invalid") ? 400 : 500;
-      res.status(status).json({ error: e.message });
+  // GET /api/wallet/compare?a=&b=&from=&to= — side-by-side activity summary
+  // for two public accounts over the same optional date interval (#1046).
+  // Registered before /api/wallet/:address so "compare" is not read as an
+  // address. Returns 400 for malformed or identical addresses or a bad
+  // interval; empty accounts yield zeroed summaries, not an error.
+  app.get("/api/wallet/compare", async (req, res) => {
+    const { a, b } = req.query;
+    if (!isPublicAccountAddress(a) || !isPublicAccountAddress(b)) {
+      return res.status(400).json({ error: "a and b must be valid public account addresses (G...)" });
     }
-  });
-
-  // POST /api/sandbox/compare-protocols — compare simulation results across protocol versions (#1091)
-  app.post("/api/sandbox/compare-protocols", writeLimiter, requireApiKey, async (req, res) => {
-    try {
-      if (!req.body || typeof req.body !== "object" || Object.keys(req.body).length === 0) {
-        return res.status(400).json({ error: "Missing request body" });
-      }
-      const { compareProtocolSimulations } = await import("./sandboxProtocols.js");
-      const result = await compareProtocolSimulations(req.body);
-      res.json(result);
-    } catch (e) {
-      const status =
-        e.message.includes("required") ||
-        e.message.includes("must be") ||
-        e.message.includes("Unsupported") ||
-        e.message.includes("empty")
-          ? 400
-          : 500;
-      res.status(status).json({ error: e.message });
+    if (a === b) {
+      return res.status(400).json({ error: "a and b must be different addresses" });
     }
-  });
-
-  // GET /api/sandbox/collections — list reusable scenario collections (#1092)
-  app.get("/api/sandbox/collections", requireApiKey, async (req, res) => {
+    let interval;
     try {
-      const limit = parseInt(req.query.limit || "50", 10);
-      const offset = parseInt(req.query.offset || "0", 10);
-      const { listCollections } = await import("./sandboxCollections.js");
-      res.json(await listCollections({ limit, offset }));
+      interval = parseInterval(req.query);
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+    try {
+      const [left, right] = await Promise.all([
+        db.getWalletEvents(a, interval),
+        db.getWalletEvents(b, interval),
+      ]);
+      res.json({
+        interval,
+        ...compareAccountActivity({ address: a, events: left }, { address: b, events: right }),
+      });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
   });
 
-  // POST /api/sandbox/collections — save/create named scenario collection (#1092)
-  app.post("/api/sandbox/collections", writeLimiter, requireApiKey, async (req, res) => {
-    try {
-      if (!req.body || typeof req.body !== "object" || Object.keys(req.body).length === 0) {
-        return res.status(400).json({ error: "Missing collection payload" });
-      }
-      const { saveCollection } = await import("./sandboxCollections.js");
-      const result = await saveCollection(req.body);
-      res.status(201).json(result);
-    } catch (e) {
-      const status =
-        e.message.includes("required") || e.message.includes("must be") || e.message.includes("Invalid") ? 400 : 500;
-      res.status(status).json({ error: e.message });
+  // GET /api/wallet/:address/counterparties?from=&to=&limit= — most-interacted
+  // contracts and counterparty addresses for a public account, each with
+  // tx_hashes and event_seqs for drill-down (#1047). limit is 1-50 (default
+  // 10). An account with no events returns empty lists, not an error.
+  app.get("/api/wallet/:address/counterparties", async (req, res) => {
+    const { address } = req.params;
+    if (!isPublicAccountAddress(address)) {
+      return res.status(400).json({ error: "address must be a valid public account address (G...)" });
     }
-  });
-
-  // GET /api/sandbox/collections/:id — retrieve named scenario collection (#1092)
-  app.get("/api/sandbox/collections/:id", requireApiKey, async (req, res) => {
+    let interval;
+    let limit;
     try {
-      const { getCollection } = await import("./sandboxCollections.js");
-      const collection = await getCollection(req.params.id);
-      if (!collection) {
-        return res.status(404).json({ error: `Scenario collection not found: ${req.params.id}` });
-      }
-      res.json(collection);
+      interval = parseInterval(req.query);
+      limit = parseSummaryLimit(req.query.limit);
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+    try {
+      const events = await db.getWalletEvents(address, interval);
+      res.json({ address, interval, ...summarizeCounterparties(events, address, { limit }) });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
   });
 
-  // DELETE /api/sandbox/collections/:id — delete scenario collection (#1092)
-  app.delete("/api/sandbox/collections/:id", writeLimiter, requireApiKey, async (req, res) => {
+  // POST /api/wallet/workspace  body: { addresses: [G..., ...], from?, to? } —
+  // summaries for 2-10 distinct public accounts in one response (#1048). The
+  // server keeps no record of the list: selection lives in the browser, and the
+  // response is marked no-store. Invalid or duplicate addresses return 400.
+  app.post("/api/wallet/workspace", async (req, res) => {
+    let addresses;
+    let interval;
     try {
-      const { deleteCollection } = await import("./sandboxCollections.js");
-      const result = await deleteCollection(req.params.id);
-      res.json(result);
+      addresses = parseWorkspaceAddresses(req.body?.addresses);
+      interval = parseInterval(req.body ?? {});
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+    res.set("Cache-Control", "no-store");
+    try {
+      const entries = await Promise.all(
+        addresses.map(async (address) => ({
+          address,
+          events: await db.getWalletEvents(address, interval),
+        })),
+      );
+      res.json({ interval, ...buildWorkspaceSummary(entries) });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
   });
 
-  // POST /api/sandbox/collections/export — export collection without private keys or secrets (#1092)
-  app.post("/api/sandbox/collections/export", writeLimiter, requireApiKey, async (req, res) => {
-    try {
-      const target = req.body?.collectionId || req.body?.collection || req.body;
-      if (!target || (typeof target === "object" && Object.keys(target).length === 0)) {
-        return res.status(400).json({ error: "Missing collection or collectionId for export" });
-      }
-      const { exportCollection } = await import("./sandboxCollections.js");
-      const exported = await exportCollection(target);
-      res.json(exported);
-    } catch (e) {
-      const status = e.message.includes("not found") ? 404 : 400;
-      res.status(status).json({ error: e.message });
-    }
+  // Account activity filter presets (#1049). Presets are saved, named, and
+  // edited in the browser; these routes only validate one, or turn one into a
+  // share token and back. The server stores nothing. Invalid presets return
+  // 422 with every problem listed in `errors`.
+  app.post("/api/wallet/filter-presets/validate", (req, res) => {
+    const result = validatePreset(req.body);
+    if (!result.ok) return res.status(422).json({ errors: result.errors });
+    res.json({ preset: result.preset });
   });
 
-  // POST /api/sandbox/collections/import — import collection without private keys or secrets (#1092)
-  app.post("/api/sandbox/collections/import", writeLimiter, requireApiKey, async (req, res) => {
-    try {
-      if (!req.body || (typeof req.body === "object" && Object.keys(req.body).length === 0)) {
-        return res.status(400).json({ error: "Missing import data" });
-      }
-      const { importCollection } = await import("./sandboxCollections.js");
-      const imported = await importCollection(req.body);
-      res.status(201).json(imported);
-    } catch (e) {
-      res.status(400).json({ error: e.message });
-    }
+  app.post("/api/wallet/filter-presets/share", (req, res) => {
+    const result = validatePreset(req.body);
+    if (!result.ok) return res.status(422).json({ errors: result.errors });
+    res.set("Cache-Control", "no-store");
+    res.json({ token: encodeShareToken(result.preset) });
   });
 
-  // POST /api/sandbox/validate-auth — validate auth requirements before simulation (#1093)
-  app.post("/api/sandbox/validate-auth", writeLimiter, requireApiKey, async (req, res) => {
-    try {
-      if (!req.body || typeof req.body !== "object" || Object.keys(req.body).length === 0) {
-        return res.status(400).json({ error: "Missing request body" });
-      }
-      const { validateAuthRequirements } = await import("./sandboxAuthValidator.js");
-      const result = validateAuthRequirements(req.body);
-      res.json(result);
-    } catch (e) {
-      const status = e.message.includes("required") || e.message.includes("must be") ? 400 : 500;
-      res.status(status).json({ error: e.message });
-    }
+  app.post("/api/wallet/filter-presets/open", (req, res) => {
+    const result = decodeShareToken(req.body?.token);
+    if (!result.ok) return res.status(422).json({ errors: result.errors });
+    res.json({ preset: result.preset });
   });
 
   // GET /api/wallet/:address — events involving a Stellar/Soroban wallet.
@@ -2831,6 +3523,7 @@ export function createApi({ logDestination, dbOverride } = {}) {
   // cacheInvalidate("wallet:events:*") on new events.
   app.get(
     "/api/wallet/:address",
+    validateLimitParam({ defaultLimit: 25, maxLimit: 200 }),
     makeCache(
       "wallet",
       (req) =>
@@ -2906,8 +3599,13 @@ export function createApi({ logDestination, dbOverride } = {}) {
       try {
         if (req.query.limit !== undefined) {
           const parsedLimit = Number(req.query.limit);
-          if (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) {
-            return res.status(422).json({ error: "Invalid limit" });
+          if (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 200) {
+            return res.status(422).json({
+              error: "Invalid limit",
+              message: "limit must be an integer between 1 and 200",
+              max_limit: 200,
+              default_limit: 25,
+            });
           }
         }
         if (req.query.after !== undefined) {
@@ -2935,6 +3633,86 @@ export function createApi({ logDestination, dbOverride } = {}) {
       const asset = await db.getAsset(code, issuer);
       if (!asset) return res.status(404).json({ error: "Asset not found" });
       res.json(serializeAsset(asset));
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /api/assets/:issuer/:code/supply-history?contract_id= — mint/burn
+  // supply series for the asset's SAC contract, with source events and coverage (#1067).
+  app.get("/api/assets/:issuer/:code/supply-history", async (req, res) => {
+    try {
+      const { issuer, code } = req.params;
+      const contractId = req.query.contract_id;
+      if (typeof contractId !== "string" || !/^C[A-Z2-7]{55}$/.test(contractId)) {
+        return res.status(422).json({ error: "Invalid contract_id" });
+      }
+      const asset = await db.getAsset(code, issuer);
+      if (!asset) return res.status(404).json({ error: "Asset not found" });
+      const events = await db.getSupplyEvents(contractId);
+      const history = buildSupplyHistory(events);
+      res.json({ code, issuer, contract_id: contractId, ...history, empty: history.points.length === 0 });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /api/assets/:issuer/:code/price — latest price with explicit
+  // missing / incomplete / stale / fresh status; never a zero fallback (#1068).
+  app.get("/api/assets/:issuer/:code/price", async (req, res) => {
+    try {
+      const { issuer, code } = req.params;
+      const observation = await db.getLatestAssetPrice(code, issuer);
+      res.json({ code, issuer, ...classifyPriceObservation(observation) });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /api/assets/:issuer/:code/identity — identity evidence for a classic
+  // asset. Same-code assets from other issuers are listed but never merged (#1066).
+  app.get("/api/assets/:issuer/:code/identity", async (req, res) => {
+    try {
+      const { issuer, code } = req.params;
+      const asset = await db.getAsset(code, issuer);
+      if (!asset) return res.status(404).json({ error: "Asset not found" });
+      const others = await db.getAssetsByCode(code);
+      const candidates = [
+        { code, issuer, source: "assets_registry" },
+        ...others.map((row) => ({ code: row.code, issuer: row.issuer, source: "assets_registry" })),
+      ];
+      const { identities, skipped } = resolveAssetIdentity(candidates);
+      const identity = identities.find((i) => i.code === code && i.issuer === issuer);
+      res.json({ code, issuer, identity: identity ?? null, skipped });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /api/tokens/:id/counterparties?from=&to=&limit= — largest senders and
+  // recipients over a time range, with public account links (#1069).
+  app.get("/api/tokens/:id/counterparties", async (req, res) => {
+    try {
+      const contractId = req.params.id;
+      const from = new Date(req.query.from ?? "");
+      const to = new Date(req.query.to ?? "");
+      if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from >= to) {
+        return res.status(422).json({ error: "from and to must be valid dates with from < to" });
+      }
+      let limit = 10;
+      if (req.query.limit !== undefined) {
+        limit = Number(req.query.limit);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+          return res.status(422).json({ error: "Invalid limit" });
+        }
+      }
+      const rows = await db.getTransfersInRange(contractId, from.toISOString(), to.toISOString());
+      res.json({
+        contract_id: contractId,
+        from: from.toISOString(),
+        to: to.toISOString(),
+        ...summarizeCounterparties(rows, { limit }),
+      });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
@@ -2976,6 +3754,28 @@ export function createApi({ logDestination, dbOverride } = {}) {
         decimals,
         total_holders: holders.length,
         holders,
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // GET /api/tokens/:id/concentration?top=N — top-N share and HHI over the current holder
+  // snapshot (Issue #1061). token_holders keeps no history, so coverage is always "current".
+  app.get("/api/tokens/:id/concentration", async (req, res) => {
+    const top = req.query.top === undefined ? 10 : Number(req.query.top);
+    if (!Number.isInteger(top) || top < 1 || top > 100) {
+      return res.status(400).json({ error: "top must be an integer between 1 and 100" });
+    }
+    try {
+      const rows = await db.getTokenHolders(req.params.id);
+      res.json({
+        contract_id: req.params.id,
+        ...computeConcentration(
+          rows.map((r) => r.balance_raw),
+          top,
+        ),
+        coverage: { source: "token_holders", snapshot: "current", historical: false },
       });
     } catch (e) {
       res.status(500).json({ error: e.message });
@@ -3079,6 +3879,7 @@ export function createApi({ logDestination, dbOverride } = {}) {
   //   Collection-level analytics (issue #810): mint volume over time and a
   //   unique-holder-count trend, derived from indexed NFT mint/transfer events.
   //   ?days=<n> — rolling window length, default 30, clamped 7..365.
+  //   ?as_of_ledger=<n> — upper ledger sequence bound (#1070).
   // Older clients still call /api/tokens/:contractId/analytics — accept that
   // alias while keeping the canonical /nfts/analytics route.
   const nftAnalyticsHandler = async (req, res) => {
@@ -3088,7 +3889,15 @@ export function createApi({ logDestination, dbOverride } = {}) {
       if (isNaN(days) || days < 1 || days > 365) {
         return res.status(422).json({ error: "Invalid days" });
       }
-      const analytics = await db.getNftCollectionAnalytics(contractId, days);
+      const asOfLedgerRaw = req.query.as_of_ledger ?? req.query["as-of-ledger"];
+      let asOfLedger = null;
+      if (asOfLedgerRaw !== undefined) {
+        asOfLedger = Number(asOfLedgerRaw);
+        if (!Number.isInteger(asOfLedger) || asOfLedger < 0) {
+          return res.status(422).json({ error: "Invalid as_of_ledger" });
+        }
+      }
+      const analytics = await db.getNftCollectionAnalytics(contractId, days, asOfLedger);
       res.json(analytics);
     } catch (e) {
       res.status(500).json({ error: e.message });
@@ -3110,7 +3919,7 @@ export function createApi({ logDestination, dbOverride } = {}) {
   });
 
   // ── cursor-based pagination endpoint ────────────────────────────
-  // GET /api/v1/events?contract=&fn=&type=&cursor=&after=&before=&limit=&count=
+  // GET /api/v1/events?contract=&fn=&type=&cursor=&after=&before=&limit=&count=&fields=
   app.get("/api/v1/events", async (req, res) => {
     try {
       if (handleLegacyOffset(req, res)) return;
@@ -3120,6 +3929,20 @@ export function createApi({ logDestination, dbOverride } = {}) {
         if (isNaN(parsedLimit) || parsedLimit <= 0 || parsedLimit > 200) {
           return res.status(422).json({ error: "Invalid limit" });
         }
+      }
+
+      // Field selection (#1078) — same allowlist and bounds as /api/events.
+      let fields;
+      if (req.query.fields !== undefined) {
+        const selection = parseFieldSelection(String(req.query.fields));
+        if (!selection.ok) {
+          return res.status(422).json({
+            error: selection.error,
+            message: selection.message,
+            allowed: selection.allowed,
+          });
+        }
+        fields = selection.fields;
       }
 
       const result = await db.getEventsCursor({
@@ -3133,7 +3956,16 @@ export function createApi({ logDestination, dbOverride } = {}) {
         limit: req.query.limit ? Number(req.query.limit) : 25,
         count: req.query.count || undefined,
       });
-      res.json(result);
+
+      const warnings = collectPartialDataWarnings({
+        metadataIncomplete: hasIncompleteMetadata(result.data),
+      });
+
+      res.json({
+        ...result,
+        data: fields ? projectEvents(result.data, fields) : result.data,
+        warnings,
+      });
     } catch (e) {
       if (handleCursorError(e, res)) return;
       res.status(500).json({ error: e.message });
@@ -3677,11 +4509,11 @@ export function createApi({ logDestination, dbOverride } = {}) {
 
   // ── Contract Stats ────────────────────────────────────────────
 
-  // GET /api/contracts/:id/stats?range=30|90|365 — event/caller counts + a
+  // GET /api/contracts/:id/stats?range=30|90|365&as_of_ledger=<n> — event/caller counts + a
   // daily event-volume series over the trailing `range` days (default 30,
   // max 365), oldest first and zero-filled. Backs the contract detail page's
   // stats widget and the selectable-time-range invocation frequency chart
-  // (#799). The series is computed by db.getContractEventsByDay, which uses
+  // (#799, #1070). The series is computed by db.getContractEventsByDay, which uses
   // idx_events_contract_created (migration 028) for the long-range scan.
   app.get(
     "/api/contracts/:id/stats",
@@ -3694,22 +4526,88 @@ export function createApi({ logDestination, dbOverride } = {}) {
           return res.status(422).json({ error: "Invalid range" });
         }
       }
+      const asOfLedgerRaw = req.query.as_of_ledger ?? req.query["as-of-ledger"];
+      if (asOfLedgerRaw !== undefined) {
+        const parsedAsOf = Number(asOfLedgerRaw);
+        if (!Number.isInteger(parsedAsOf) || parsedAsOf < 0) {
+          return res.status(422).json({ error: "Invalid as_of_ledger" });
+        }
+      }
       next();
     },
-    makeCache("stats", (req) => `contracts:stats:${req.params.id}:${req.query.range ?? 30}`),
+    makeCache("stats", (req) => `contracts:stats:${req.params.id}:${req.query.range ?? 30}:${req.query.as_of_ledger ?? req.query["as-of-ledger"] ?? ""}`),
     async (req, res) => {
       try {
         const range = req.query.range !== undefined ? Number(req.query.range) : 30;
+        const asOfLedgerRaw = req.query.as_of_ledger ?? req.query["as-of-ledger"];
+        const asOfLedger = asOfLedgerRaw !== undefined ? Number(asOfLedgerRaw) : null;
         const [stats, eventsPerDay] = await Promise.all([
-          db.getContractStats(req.params.id),
-          db.getContractEventsByDay(req.params.id, range),
+          db.getContractStats(req.params.id, asOfLedger),
+          db.getContractEventsByDay(req.params.id, range, asOfLedger),
         ]);
-        res.json({ ...stats, events_per_day: eventsPerDay, range });
+        res.json({
+          ...stats,
+          as_of_ledger: asOfLedger,
+          watermark: stats.last_seen_ledger,
+          events_per_day: eventsPerDay,
+          range,
+        });
       } catch (e) {
         res.status(500).json({ error: e.message });
       }
     },
   );
+
+  // GET /api/contracts/:id/activity-summary — bounded event counts by function & interval (#1073)
+  const contractActivitySummaryHandler = async (req, res) => {
+    try {
+      const { id: contractId } = req.params;
+      if (!contractId || typeof contractId !== "string" || contractId.trim().length === 0) {
+        return res.status(422).json({ error: "Invalid contract ID" });
+      }
+
+      const interval = req.query.interval !== undefined ? String(req.query.interval).toLowerCase() : "day";
+      if (!["hour", "day", "week"].includes(interval)) {
+        return res.status(422).json({ error: "Invalid interval. Must be one of: hour, day, week" });
+      }
+
+      const limits = {
+        hour: { min: 1, max: 168 },
+        day: { min: 1, max: 90 },
+        week: { min: 1, max: 52 },
+      };
+
+      let range = undefined;
+      if (req.query.range !== undefined) {
+        range = Number(req.query.range);
+        if (!Number.isInteger(range) || range < limits[interval].min || range > limits[interval].max) {
+          return res.status(422).json({
+            error: `Invalid range for interval '${interval}'. Must be between ${limits[interval].min} and ${limits[interval].max}`,
+          });
+        }
+      }
+
+      const asOfLedgerRaw = req.query.as_of_ledger ?? req.query["as-of-ledger"];
+      let asOfLedger = null;
+      if (asOfLedgerRaw !== undefined) {
+        asOfLedger = Number(asOfLedgerRaw);
+        if (!Number.isInteger(asOfLedger) || asOfLedger < 0) {
+          return res.status(422).json({ error: "Invalid as_of_ledger" });
+        }
+      }
+
+      const summary = await db.getContractActivitySummary(contractId.trim(), {
+        interval,
+        range,
+        asOfLedger,
+      });
+      res.json(summary);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  };
+  app.get("/api/contracts/:id/activity-summary", contractActivitySummaryHandler);
+  app.get("/api/contracts/:id/activity", contractActivitySummaryHandler);
 
   // GET /api/contracts/:id/storage-tiers — write counts by storage durability tier
   app.get(

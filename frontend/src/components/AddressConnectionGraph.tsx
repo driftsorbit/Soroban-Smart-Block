@@ -3,7 +3,7 @@
  * Visual map of how a contract interacts with external addresses and other contracts.
  * Uses Cytoscape.js for interactive node-based graph rendering.
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
@@ -48,8 +48,8 @@ export default function AddressConnectionGraph({ contractId, variant = "address"
     queryFn: () => (isCallGraph ? api.contractCallGraph(contractId) : api.addressGraph(contractId)),
     enabled: !!contractId,
   });
-  const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
-  const edges = Array.isArray(data?.edges) ? data.edges : [];
+  const nodes = useMemo(() => (Array.isArray(data?.nodes) ? data.nodes : []), [data]);
+  const edges = useMemo(() => (Array.isArray(data?.edges) ? data.edges : []), [data]);
 
   useEffect(() => {
     if (!data || !containerRef.current) return;
@@ -139,7 +139,7 @@ export default function AddressConnectionGraph({ contractId, variant = "address"
         cyRef.current = null;
       }
     };
-  }, [data, isCallGraph, navigate]);
+  }, [data, nodes, edges, isCallGraph, navigate]);
 
   if (isLoading) return <p style={{ color: "var(--muted)" }}>Loading graph…</p>;
   if (error) return <p style={{ color: "#ef4444" }}>Failed to load {isCallGraph ? "call" : "address"} graph.</p>;

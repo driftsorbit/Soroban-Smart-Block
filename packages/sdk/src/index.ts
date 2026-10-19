@@ -1,11 +1,22 @@
 /**
  * Soroban Smart Block Explorer TypeScript SDK
  *
- * Thin fetch wrapper for consuming the Soroban Smart Block Explorer API.
- *
- * Note: Generated type definitions (api.types.ts) are produced by openapi-typescript.
- * Run `npm run generate-types` to generate them against docs/api/openapi.yaml.
+ * Fetch wrapper for consuming the Soroban Smart Block Explorer API with
+ * configurable retry/backoff policies (#1082), request cancellation/timeouts (#1083),
+ * typed webhook verification (#1084), and ABI event decoding (#1085).
  */
+
+import {
+  RetryPolicy,
+  DEFAULT_RETRY_POLICY,
+  calculateBackoffDelay,
+  isRetryableMethod,
+  isRetryableStatus,
+  isRetryableNetworkError,
+  combineSignals,
+  sleep,
+  TimeoutError,
+} from './retry.js';
 
 export interface ClientConfig {
   baseUrl?: string;
@@ -14,11 +25,21 @@ export interface ClientConfig {
   csrfToken?: string;
   timeout?: number;
   headers?: Record<string, string>;
+  /** Global retry policy. Set to false to disable retries. */
+  retry?: RetryPolicy | boolean;
 }
 
 export interface RequestOptions extends Omit<RequestInit, 'body'> {
   body?: unknown;
   params?: Record<string, string | number | boolean | undefined>;
+  /** Per-request timeout in milliseconds (overrides client default). */
+  timeout?: number;
+  /** Explicit cancellation signal. */
+  signal?: AbortSignal;
+  /** Per-request retry policy or false to disable retries. */
+  retry?: RetryPolicy | boolean;
+  /** Explicit flag indicating this request is safe/idempotent to retry. */
+  idempotent?: boolean;
 }
 
 export interface ResponseMetadata {
@@ -31,15 +52,34 @@ export interface ResponseMetadata {
   rateLimitTier?: string;
 }
 
-export interface ApiResponse<T> {
-  data: T;
-  meta: ResponseMetadata;
+/**
+ * Combine a caller-supplied signal with the client timeout so cancellation
+ * does not silently disable the timeout (and vice versa).
+ */
+function withTimeout(userSignal: AbortSignal | null | undefined, ms: number): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(ms);
+  if (!userSignal) return timeoutSignal;
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([userSignal, timeoutSignal]);
+  }
+  const controller = new AbortController();
+  if (userSignal.aborted) {
+    controller.abort(userSignal.reason);
+  } else {
+    userSignal.addEventListener('abort', () => controller.abort(userSignal.reason), { once: true });
+  }
+  timeoutSignal.addEventListener('abort', () => controller.abort(timeoutSignal.reason), { once: true });
+  return controller.signal;
 }
 
-export { verifyEventInclusion } from "./verify.js";
-export type { EventInclusionProof } from "./verify.js";
 export { signRequest } from "./signing.js";
 export type { SignRequestInput } from "./signing.js";
+
+export * from './verify.js';
+export * from './signing.js';
+export * from './webhook.js';
+export * from './retry.js';
+export * from './events.js';
 
 export class ExplorerApiClient {
   private baseUrl: string;
@@ -48,13 +88,15 @@ export class ExplorerApiClient {
   private csrfToken?: string;
   private timeout: number;
   private defaultHeaders: Record<string, string>;
+  private defaultRetry?: RetryPolicy | boolean;
 
   constructor(config: ClientConfig = {}) {
     this.baseUrl = config.baseUrl || 'http://localhost:3001';
     this.apiKey = config.apiKey;
     this.bearerToken = config.bearerToken;
     this.csrfToken = config.csrfToken;
-    this.timeout = config.timeout || 30000;
+    this.timeout = config.timeout ?? 30000;
+    this.defaultRetry = config.retry;
     this.defaultHeaders = {
       'Content-Type': 'application/json',
       ...config.headers,
@@ -74,44 +116,181 @@ export class ExplorerApiClient {
   }
 
   /**
-   * Make an HTTP request to the API.
+   * Make an HTTP request to the API with retry, timeout, and cancellation support.
    */
   async request<T>(
     method: string,
     endpoint: string,
     options: RequestOptions = {}
   ): Promise<ApiResponse<T>> {
-    const url = this.buildUrl(endpoint, options.params);
+    const { params, signal, ...rest } = options;
+    const url = this.buildUrl(endpoint, params);
     const headers = this.buildHeaders(method);
-    const fetchOptions: RequestInit = {
-      method,
-      headers,
-      signal: AbortSignal.timeout(this.timeout),
-      ...options,
-      body: options.body ? JSON.stringify(options.body) : undefined,
-    };
+    const timeoutMs = options.timeout ?? this.timeout;
 
-    let response: Response;
-    try {
-      response = await fetch(url, fetchOptions);
-    } catch (error) {
-      if (error instanceof TypeError && error.message.includes('Failed to fetch')) {
-        throw new Error(`Network error: ${error.message}`);
+    // Resolve retry policy
+    const effectiveRetry = options.retry !== undefined ? options.retry : this.defaultRetry;
+    const retryPolicy: RetryPolicy =
+      effectiveRetry === false
+        ? { maxRetries: 0 }
+        : typeof effectiveRetry === 'object'
+          ? { ...DEFAULT_RETRY_POLICY, ...effectiveRetry }
+          : effectiveRetry === true
+            ? { ...DEFAULT_RETRY_POLICY }
+            : { ...DEFAULT_RETRY_POLICY };
+
+    const maxRetries = retryPolicy.maxRetries ?? 0;
+    const canRetryMethod = isRetryableMethod(method, retryPolicy, options.idempotent);
+
+    let attempt = 0;
+
+    while (true) {
+      attempt++;
+
+      // Abort early if user signal is already aborted
+      if (options.signal?.aborted) {
+        throw options.signal.reason ?? new Error('Request cancelled');
       }
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw new Error(`Request timeout after ${this.timeout}ms`);
+
+      let timeoutController: AbortController | undefined;
+      let timer: any = null;
+
+      if (timeoutMs > 0) {
+        timeoutController = new AbortController();
+        timer = setTimeout(() => {
+          timeoutController?.abort(new TimeoutError(timeoutMs));
+        }, timeoutMs);
       }
-      throw error;
+
+      const { signal, cleanup } = combineSignals(options.signal, timeoutController?.signal);
+
+      const fetchOptions: RequestInit = {
+        method,
+        headers,
+        signal,
+        ...options,
+        body: options.body ? JSON.stringify(options.body) : undefined,
+      };
+
+      let response: Response | undefined;
+      let networkError: Error | undefined;
+
+      try {
+        response = await fetch(url, fetchOptions);
+      } catch (err: any) {
+        if (timer) clearTimeout(timer);
+        cleanup();
+
+        if (options.signal?.aborted) {
+          throw options.signal.reason ?? err;
+        }
+
+        if (timeoutController?.signal.aborted) {
+          const reason = timeoutController.signal.reason;
+          if (reason instanceof TimeoutError) throw reason;
+          throw new TimeoutError(timeoutMs);
+        }
+
+        if (err instanceof Error && err.name === 'AbortError') {
+          if (options.signal?.aborted) throw options.signal.reason ?? err;
+          throw new TimeoutError(timeoutMs);
+        }
+
+        networkError = err;
+      } finally {
+        if (timer) clearTimeout(timer);
+        cleanup();
+      }
+
+      if (response && response.ok) {
+        const data = await this.parseResponse<T>(response);
+        const meta = this.extractMetadata(response);
+        return { data, meta };
+      }
+
+      // Check whether this failure can be retried
+      const status = response ? response.status : undefined;
+      const isRetryableOutcome =
+        canRetryMethod &&
+        attempt <= maxRetries &&
+        !options.signal?.aborted &&
+        ((response && isRetryableStatus(status!, retryPolicy)) ||
+          (networkError && isRetryableNetworkError(networkError)));
+
+      let shouldRetry = isRetryableOutcome;
+      if (shouldRetry && retryPolicy.shouldRetry) {
+        shouldRetry = retryPolicy.shouldRetry({
+          attempt,
+          maxRetries,
+          method,
+          url,
+          error: networkError,
+          status,
+          delayMs: 0,
+          retryAfterHeader: response?.headers.get('Retry-After'),
+        });
+      }
+
+      if (shouldRetry) {
+        const retryAfter = response?.headers.get('Retry-After');
+        const delayMs = calculateBackoffDelay(attempt, retryPolicy, retryAfter);
+
+        if (retryPolicy.onRetry) {
+          retryPolicy.onRetry({
+            attempt,
+            maxRetries,
+            method,
+            url,
+            error: networkError,
+            status,
+            delayMs,
+            retryAfterHeader: retryAfter,
+          });
+        }
+
+        try {
+          await sleep(delayMs, options.signal);
+        } catch (sleepErr) {
+          if (options.signal?.aborted) {
+            throw options.signal.reason ?? sleepErr;
+          }
+          throw sleepErr;
+        }
+
+        continue;
+      }
+
+      // Cannot retry — raise final error
+      if (networkError) {
+        if (networkError instanceof TypeError && networkError.message.includes('Failed to fetch')) {
+          throw new Error(`Network error: ${networkError.message}`);
+        }
+        throw networkError;
+      }
+
+      const data = await this.parseResponse<T>(response!);
+      const meta = this.extractMetadata(response!);
+      throw new ApiError(response!.status, response!.statusText, data, meta);
     }
+  }
 
-    const data = await this.parseResponse<T>(response);
-    const meta = this.extractMetadata(response);
-
-    if (!response.ok) {
-      throw new ApiError(response.status, response.statusText, data, meta);
-    }
-
-    return { data, meta };
+  /**
+   * Iterate events with automatic cursor pagination (#1080).
+   *
+   * Returns a lazy, cancellable async iterator that follows `next_cursor`
+   * across pages. See `IterateEventsOptions` for filters, page size, bounds
+   * and cancellation.
+   *
+   * ```ts
+   * for await (const event of client.iterateEvents({ contract: 'C...', limit: 100 })) {
+   *   // ...
+   * }
+   * ```
+   */
+  iterateEvents<T = EventRecord>(
+    options: IterateEventsOptions = {},
+  ): EventIterator<T> {
+    return createEventIterator<T>(this, options, '/api/events');
   }
 
   /**
@@ -227,22 +406,14 @@ export class ExplorerApiClient {
   setCsrfToken(token: string): void {
     this.csrfToken = token;
   }
-}
 
-/**
- * API error response.
- */
-export class ApiError extends Error {
-  constructor(
-    public status: number,
-    public statusText: string,
-    public data: unknown,
-    public meta: ResponseMetadata
-  ) {
-    super(`API Error ${status}: ${statusText}`);
-    Object.setPrototypeOf(this, ApiError.prototype);
+  setRetryPolicy(retry?: RetryPolicy | boolean): void {
+    this.defaultRetry = retry;
   }
 }
+
+// NOTE: The `ApiError` class (and its typed subclasses) now live in
+// `errors.ts` and are re-exported above for backwards compatibility.
 
 /**
  * Create a default client instance.
@@ -252,5 +423,3 @@ export function createClient(config?: ClientConfig): ExplorerApiClient {
 }
 
 export default ExplorerApiClient;
-
-export * from './verify';

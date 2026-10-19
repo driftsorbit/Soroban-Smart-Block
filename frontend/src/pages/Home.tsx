@@ -1,15 +1,17 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import type { DecodedEvent } from "../api";
 import EventTable from "../components/EventTable";
+import { parseExplorerFilters, filterByLedgerRange } from "../utils/explorerFilters";
 import ExportButton from "../components/ExportButton";
 import SkeletonLoader from "../components/SkeletonLoader";
 import StatsBar from "../components/StatsBar";
 import LatestLedgers from "../components/LatestLedgers";
 import { useEventStream } from "../hooks/useEventStream";
 import { useMetaTags } from "../hooks/useMetaTags";
+import { parseFeedDensity, type FeedDensity } from "../utils/feedDensity";
 
 const FUNCTIONS = ["", "swap", "transfer", "mint", "burn", "stake", "unstake", "wrap_native", "unwrap_native"];
 
@@ -59,6 +61,7 @@ export default function Home() {
       ? (searchParams.get("type") as TxType)
       : "all",
   );
+  const density: FeedDensity = parseFeedDensity(searchParams.get("density"));
   const [fromDate, setFromDate] = useState(searchParams.get("from") ?? "");
   const [toDate, setToDate] = useState(searchParams.get("to") ?? "");
   const previousContract = useRef(contractParam);
@@ -116,7 +119,17 @@ export default function Home() {
       }),
     getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
   });
-  const events = eventsPages?.pages.flatMap((page) => page.data) ?? [];
+  // Ledger range from the URL (#1038). The events API has no ledger filter, so
+  // the range is applied to the events already loaded.
+  const { filters: shareFilters, errors: filterErrors } = useMemo(
+    () => parseExplorerFilters(searchParams),
+    [searchParams],
+  );
+  const events = filterByLedgerRange(
+    eventsPages?.pages.flatMap((page) => page.data) ?? [],
+    shareFilters.fromLedger,
+    shareFilters.toLedger,
+  );
 
   // invalidate the event list when a live event arrives on the first page
   const handleLiveEvent = useCallback(
@@ -251,6 +264,26 @@ export default function Home() {
           />
         </label>
 
+        {/* Density toggle (#1035): comfortable is the default, so it clears the param */}
+        <div style={{ display: "flex", borderRadius: 6, overflow: "hidden", border: "1px solid var(--border)" }}>
+          {(["comfortable", "compact"] as const).map((value) => (
+            <button
+              key={value}
+              aria-pressed={density === value}
+              onClick={() => updateView({ density: value === "comfortable" ? undefined : value })}
+              style={{
+                background: density === value ? "var(--accent)" : "var(--surface)",
+                color: density === value ? "#0d1117" : "var(--muted)",
+                borderRadius: 0,
+                padding: "6px 14px",
+                fontWeight: density === value ? 700 : 400,
+              }}
+            >
+              {value === "comfortable" ? "Comfortable" : "Compact"}
+            </button>
+          ))}
+        </div>
+
         <ExportButton
           target="events"
           params={{
@@ -261,12 +294,16 @@ export default function Home() {
         />
       </div>
 
+      {!isLoading && <LedgerScrubber events={events} />}
+
       <div className="card">
         {isLoading ? (
           <SkeletonLoader />
         ) : (
           <EventTable
             events={events}
+            scrollKey={searchParams.toString()}
+            density={density}
             onReachEnd={hasNextPage && !isFetchingNextPage ? () => void fetchNextPage() : undefined}
           />
         )}

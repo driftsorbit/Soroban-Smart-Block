@@ -5,7 +5,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    token, Bytes, BytesN, Env, String, Symbol, Vec,
+    Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 mod state;
@@ -172,14 +172,6 @@ impl StoredMeta {
             StoredMeta::V1(meta) | StoredMeta::V2(meta) => meta,
         }
     }
-}
-
-#[allow(missing_docs)]
-#[contracttype]
-#[derive(Clone)]
-pub struct DepositRecord {
-    pub amount: i128,
-    pub token: Address,
 }
 
 /// Describes one callable function so the explorer can decode calls.
@@ -402,54 +394,9 @@ impl ExplorerContract {
             panic_with_error!(&env, Error::InvalidInput);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::SchemaVersion, &1u32);
-        env.storage().instance().set(&DataKey::MigrationCursor, &0u32);
         env.storage().instance().set(&DataKey::EventSeq, &0u64);
         env.storage().instance().set(&DataKey::MaxEvents, &cap);
         Self::bump_instance_ttl(&env);
-    }
-
-    /// Configure the refundable registration deposit. Admin-only.
-    pub fn set_registration_deposit(env: Env, caller: Address, amount: i128, token: Address) {
-        caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != admin || amount < 0 {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        env.storage().instance().set(&DataKey::RegistrationDepositAmount, &amount);
-        env.storage().instance().set(&DataKey::RegistrationDepositToken, &token);
-    }
-
-    /// Configure the treasury receiving forfeited registration deposits.
-    pub fn set_registration_treasury(env: Env, caller: Address, treasury: Address) {
-        caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if caller != admin { panic_with_error!(&env, Error::Unauthorized); }
-        env.storage().instance().set(&DataKey::RegistrationTreasury, &treasury);
-    }
-
-    /// Return the deposit held for a registered contract.
-    pub fn deposit_of(env: Env, contract_id: BytesN<32>) -> i128 {
-        env.storage().persistent().get::<DataKey, DepositRecord>(&DataKey::ContractDeposit(contract_id)).map(|d| d.amount).unwrap_or(0)
-    }
-
-    /// Return the current storage schema version.
-    pub fn schema_version(env: Env) -> u32 { env.storage().instance().get(&DataKey::SchemaVersion).unwrap_or(1) }
-
-    /// Resumable, bounded schema migration entrypoint.
-    pub fn migrate(env: Env, caller: Address, from: u32, to: u32, batch: u32) {
-        caller.require_auth();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        let current: u32 = env.storage().instance().get(&DataKey::SchemaVersion).unwrap_or(1);
-        if caller != admin || from != current || to < from || batch == 0 {
-            panic_with_error!(&env, Error::InvalidInput);
-        }
-        // Contract metadata is read through StoredMeta-compatible accessors in
-        // new deployments; this cursor makes the operation resumable and keeps
-        // each invocation bounded even when no entries need rewriting.
-        let cursor: u32 = env.storage().instance().get(&DataKey::MigrationCursor).unwrap_or(0);
-        env.storage().instance().set(&DataKey::MigrationCursor, &(cursor.saturating_add(batch)));
-        env.storage().instance().set(&DataKey::SchemaVersion, &to);
     }
 
     /// Transfer admin rights to a new address (current admin only).
@@ -473,7 +420,7 @@ impl ExplorerContract {
             .instance()
             .set(&DataKey::Role(account.clone()), &role);
         env.events()
-            .publish((symbol_short!("role_grant"), account), role);
+            .publish((Symbol::new(&env, "role_grant"), account), role);
     }
 
     /// Revoke all delegated privileges from an account.
@@ -481,7 +428,7 @@ impl ExplorerContract {
         Self::bump_instance_ttl(&env);
         Self::require_admin(&env, &caller);
         env.storage().instance().remove(&DataKey::Role(account.clone()));
-        env.events().publish((symbol_short!("role_revoke"),), account);
+        env.events().publish((Symbol::new(&env, "role_revoke"),), account);
     }
 
     /// Return the delegated role assigned to an account, if any.
@@ -605,14 +552,6 @@ impl ExplorerContract {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_EXTEND_TO,
         );
-        let deposit_amount: i128 = env.storage().instance().get(&DataKey::RegistrationDepositAmount).unwrap_or(0);
-        if deposit_amount > 0 {
-            let deposit_token: Address = env.storage().instance().get(&DataKey::RegistrationDepositToken).unwrap();
-            token::Client::new(&env, &deposit_token).transfer(&caller, &env.current_contract_address(), &deposit_amount);
-            let dkey = DataKey::ContractDeposit(contract_id.clone());
-            env.storage().persistent().set(&dkey, &DepositRecord { amount: deposit_amount, token: deposit_token });
-        }
-
         // Version history entry for abi_version 0.
         let vkey = DataKey::ContractVersion(VersionKey {
             contract_id: contract_id.clone(),
@@ -840,15 +779,6 @@ impl ExplorerContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if !state::can_modify_entry(caller == admin, caller == existing.registered_by) {
             panic_with_error!(&env, Error::Unauthorized);
-        }
-
-        if let Some(deposit) = env.storage().persistent().get::<DataKey, DepositRecord>(&DataKey::ContractDeposit(contract_id.clone())) {
-            if caller == existing.registered_by {
-                token::Client::new(&env, &deposit.token).transfer(&env.current_contract_address(), &caller, &deposit.amount);
-            } else if let Some(treasury) = env.storage().instance().get::<DataKey, Address>(&DataKey::RegistrationTreasury) {
-                token::Client::new(&env, &deposit.token).transfer(&env.current_contract_address(), &treasury, &deposit.amount);
-            }
-            env.storage().persistent().remove(&DataKey::ContractDeposit(contract_id.clone()));
         }
 
         env.storage().persistent().remove(&key);
@@ -1151,9 +1081,6 @@ impl ExplorerContract {
         state::retained_count(seq, max)
     }
 
-    /// Return the rolling Merkle commitment and number of submitted events.
-    pub fn get_root(env: Env) -> (BytesN<32>, u64) { mmr::root(&env) }
-
     /// Fetch a page of decoded events starting from `cursor`.
     /// Returns at most `limit` events. Skips events evicted from the ring buffer.
     pub fn get_events(env: Env, cursor: u64, limit: u32) -> Vec<DecodedEvent> {
@@ -1194,7 +1121,7 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Events as _},
-        token, Env,
+        Env,
     };
 
     fn setup() -> (Env, ExplorerContractClient<'static>) {
@@ -1414,9 +1341,9 @@ mod tests {
     fn test_submit_events_crossing_max_events_reverts() {
         let (env, client) = setup();
         let admin = Address::generate(&env);
-        client.init(&admin, &5u32);
+        client.init(&admin, &MIN_MAX_EVENTS);
         assert!(client
-            .try_submit_events(&admin, &batch_of(&env, 6))
+            .try_submit_events(&admin, &batch_of(&env, MAX_BATCH + 1))
             .is_err());
         assert_eq!(client.event_count(), 0);
     }
@@ -1818,24 +1745,25 @@ mod tests {
     fn test_ring_buffer_wraps_correctly() {
         let (env, client) = setup();
         let admin = Address::generate(&env);
-        client.init(&admin, &5u32);
+        client.init(&admin, &MIN_MAX_EVENTS);
         let cid: BytesN<32> = BytesN::from_array(&env, &[10u8; 32]);
         let base = make_input(&env, &cid);
 
-        for _ in 0..5 {
+        env.budget().reset_unlimited();
+        for _ in 0..MIN_MAX_EVENTS {
             client.submit_event(&admin, &base);
         }
-        assert_eq!(client.event_count(), 5u64);
+        assert_eq!(client.event_count(), MIN_MAX_EVENTS as u64);
 
         for _ in 0..10 {
             client.submit_event(&admin, &base);
         }
-        assert_eq!(client.event_count(), 5u64);
+        assert_eq!(client.event_count(), MIN_MAX_EVENTS as u64);
 
         let evs = client.get_events(&0u64, &20u32);
-        assert_eq!(evs.len(), 5);
+        assert_eq!(evs.len(), 20);
         assert_eq!(evs.get(0).unwrap().seq, 10);
-        assert_eq!(evs.get(4).unwrap().seq, 14);
+        assert_eq!(evs.get(19).unwrap().seq, 29);
     }
 
     #[test]
@@ -1941,11 +1869,12 @@ mod tests {
     fn test_cap_hit_event_emitted_on_eviction() {
         let (env, client) = setup();
         let admin = Address::generate(&env);
-        client.init(&admin, &5u32);
+        client.init(&admin, &MIN_MAX_EVENTS);
         let cid: BytesN<32> = BytesN::from_array(&env, &[23u8; 32]);
         let base = make_input(&env, &cid);
 
-        for _ in 0..5 {
+        env.budget().reset_unlimited();
+        for _ in 0..MIN_MAX_EVENTS {
             client.submit_event(&admin, &base);
         }
         let before = env.events().all().len();
@@ -2523,22 +2452,5 @@ mod tests {
             ..meta_v0
         };
         client.update_contract(&admin, &cid, &meta_v1);
-    }
-
-    #[test]
-    fn test_registration_deposit_refunds_owner_on_deregister() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        client.init(&admin, &0u32);
-        let sac = env.register_stellar_asset_contract_v2(admin.clone());
-        let token = sac.address();
-        token::StellarAssetClient::new(&env, &token).mint(&admin, &100);
-        client.set_registration_deposit(&admin, &25, &token);
-        let cid = BytesN::from_array(&env, &[71u8; 32]);
-        client.register_contract(&admin, &cid, &make_meta(&env, "Deposited", &admin));
-        assert_eq!(client.deposit_of(&cid), 25);
-        client.deregister_contract(&admin, &cid);
-        assert_eq!(client.deposit_of(&cid), 0);
-        assert_eq!(token::Client::new(&env, &token).balance(&admin), 100);
     }
 }

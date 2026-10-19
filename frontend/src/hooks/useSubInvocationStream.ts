@@ -1,5 +1,5 @@
 // Issue #210: Real-time sub-invocation streaming via SSE and WebSocket
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef } from "react";
 import type { SubInvocationExtended, SubInvocationFilter } from "../api";
 import { api } from "../api";
 
@@ -32,11 +32,18 @@ export function useSubInvocationStream({
     onErrorRef.current = onError;
   }, [onError]);
 
+  const filterContract = filter?.contract;
+  const filterFunction = filter?.function;
+
   useEffect(() => {
     if (!enabled) return;
+    const streamFilter =
+      filterContract === undefined && filterFunction === undefined
+        ? undefined
+        : { contract: filterContract, function: filterFunction };
 
     if (mode === "sse") {
-      const url = api.subInvocationStreamUrl(filter);
+      const url = api.subInvocationStreamUrl(streamFilter);
       const es = new EventSource(url);
 
       es.onopen = () => {
@@ -64,7 +71,7 @@ export function useSubInvocationStream({
     }
 
     // WebSocket mode
-    const wsBase = api.subInvocationStreamUrl(filter).replace(/^\/api/, "");
+    const wsBase = api.subInvocationStreamUrl(streamFilter).replace(/^\/api/, "");
     const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/sub-invocations${wsBase ? `?${wsBase.split("?")[1] ?? ""}` : ""}`;
     const ws = new WebSocket(wsUrl);
 
@@ -96,7 +103,7 @@ export function useSubInvocationStream({
       ws.close();
       connectedRef.current = false;
     };
-  }, [enabled, mode, filter?.contract, filter?.function]);
+  }, [enabled, mode, filterContract, filterFunction]);
 
   return { connected: connectedRef.current };
 }
@@ -105,6 +112,5 @@ export function useSubInvocationLiveFeed(
   onInvocation: (inv: SubInvocationExtended) => void,
   filter?: Pick<SubInvocationFilter, "contract" | "function">,
 ): { connected: boolean } {
-  const stableCallback = useCallback(onInvocation, []);
-  return useSubInvocationStream({ filter, onInvocation: stableCallback, mode: "sse" });
+  return useSubInvocationStream({ filter, onInvocation, mode: "sse" });
 }

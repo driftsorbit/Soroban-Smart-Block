@@ -49,7 +49,7 @@ export const ALERT_CONDITIONS = Object.freeze({
   AUDIT_PARTITION_FAILURE: "AUDIT_PARTITION_FAILURE",
   PROTOCOL_UNSUPPORTED: "PROTOCOL_UNSUPPORTED",
   RPC_PROVIDER_DISAGREEMENT: "RPC_PROVIDER_DISAGREEMENT",
-};
+});
 
 const SEVERITY = {
   [ALERT_CONDITIONS.INDEXER_DOWN]: "critical",
@@ -66,6 +66,8 @@ const SEVERITY = {
   [ALERT_CONDITIONS.AUDIT_PARTITION_FAILURE]: "critical",
   [ALERT_CONDITIONS.PROTOCOL_UNSUPPORTED]: "critical",
   [ALERT_CONDITIONS.RPC_PROVIDER_DISAGREEMENT]: "critical",
+  [ALERT_CONDITIONS.ALERTING_PIPELINE_LAG]: "critical",
+  [ALERT_CONDITIONS.DB_POOL_SATURATION]: "warning",
 };
 
 // Active alert state — maps condition → timestamp when first fired
@@ -288,6 +290,41 @@ export async function checkAlertingPipelineLag(lagSeconds) {
   }
 }
 
+/**
+ * Check database connection pool saturation.
+ *
+ * @param {object} stats Pool stats: { saturation, waitTimeMs, waitingCount, avgWaitTimeMs }
+ */
+export async function checkDbPoolSaturation(stats) {
+  if (!stats || typeof stats !== "object") return;
+  const saturationThreshold = Number(process.env.DB_POOL_SATURATION_THRESHOLD ?? 0.85);
+  const waitTimeThresholdMs = Number(process.env.DB_POOL_WAIT_TIME_THRESHOLD_MS ?? 1000);
+
+  const saturation = Number(stats.saturation ?? 0);
+  const waitTimeMs = Number(stats.avgWaitTimeMs ?? stats.waitTimeMs ?? 0);
+  const waitingCount = Number(stats.waitingCount ?? stats.waiting ?? 0);
+
+  const isSaturated = saturation >= saturationThreshold || waitTimeMs >= waitTimeThresholdMs || waitingCount > 0;
+  if (isSaturated) {
+    const reasons = [];
+    if (saturation >= saturationThreshold) {
+      reasons.push(`saturation ${(saturation * 100).toFixed(1)}% >= ${(saturationThreshold * 100).toFixed(1)}%`);
+    }
+    if (waitTimeMs >= waitTimeThresholdMs) {
+      reasons.push(`wait time ${waitTimeMs}ms >= ${waitTimeThresholdMs}ms`);
+    }
+    if (waitingCount > 0) {
+      reasons.push(`${waitingCount} waiting client${waitingCount === 1 ? "" : "s"}`);
+    }
+    await fireAlert(
+      ALERT_CONDITIONS.DB_POOL_SATURATION,
+      `Database connection pool saturated: ${reasons.join(", ")}`,
+    );
+  } else {
+    resolveAlert(ALERT_CONDITIONS.DB_POOL_SATURATION);
+  }
+}
+
 export default Object.freeze({
   ALERT_CONDITIONS,
   fireAlert,
@@ -304,4 +341,5 @@ export default Object.freeze({
   alertReorg,
   checkDecodeRate,
   checkAlertingPipelineLag,
+  checkDbPoolSaturation,
 });

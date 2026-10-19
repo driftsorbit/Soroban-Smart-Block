@@ -10,6 +10,26 @@ Compare in constant time and always hash the **raw** body, not re-serialised JSO
 
 <!-- snippet: examples/tutorials/04-webhook-consumer/index.mjs#verify -->
 
+You can also use the `@soroban-explorer/sdk` typed helper with automatic timestamp tolerance and replay protection:
+
+```typescript
+import { verifyWebhookSignature, createReplayCache } from '@soroban-explorer/sdk';
+
+const replayCache = createReplayCache();
+
+const result = await verifyWebhookSignature({
+  secret: process.env.WEBHOOK_SECRET,
+  rawBody: req.body, // raw bytes or string
+  headers: req.headers, // extracts X-Webhook-Signature and X-Webhook-Timestamp
+  tolerance: 300, // 5-minute tolerance window
+  replayCache,
+});
+
+if (!result.valid) {
+  return res.status(401).send(`Invalid webhook: ${result.error}`);
+}
+```
+
 ## Serve deliveries
 
 <!-- snippet: examples/tutorials/04-webhook-consumer/index.mjs#server -->

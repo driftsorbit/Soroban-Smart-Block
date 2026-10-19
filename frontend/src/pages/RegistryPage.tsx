@@ -8,7 +8,7 @@
  * - Empty state with link to register form
  * - Cursor pagination that remains stable as contracts are added
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { api, type ContractListItem, type ContractsListResponse, type ContractStats } from "../api";
@@ -167,7 +167,7 @@ export default function RegistryPage() {
     placeholderData: keepPreviousData,
   });
 
-  const contracts = data?.contracts ?? [];
+  const contracts = useMemo(() => data?.contracts ?? [], [data]);
   const pagination = data?.pagination;
   const nextCursor = data?.next_cursor ?? null;
 
@@ -179,9 +179,12 @@ export default function RegistryPage() {
   // Batch-fetch event-count / last-activity stats for the visible contracts,
   // capped at MAX_CONCURRENT_STATS_FETCHES concurrent requests (#609).
   const [statsById, setStatsById] = useState<Record<string, ContractStats>>({});
+  // Read through a ref so writing stats does not re-trigger this effect (#978).
+  const statsByIdRef = useRef(statsById);
+  statsByIdRef.current = statsById;
 
   useEffect(() => {
-    const ids = contracts.map((c) => c.id).filter((id) => !(id in statsById));
+    const ids = contracts.map((c) => c.id).filter((id) => !(id in statsByIdRef.current));
     if (ids.length === 0) return;
 
     let cancelled = false;

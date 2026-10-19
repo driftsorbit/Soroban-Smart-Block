@@ -131,6 +131,8 @@ export interface DecodedEvent {
   contract_id: string;
   function: string;
   ledger: number;
+  /** Ledger close time (ISO 8601). Optional: used by the activity calendar (#1040). */
+  closed_at?: string | null;
   description: string;
   raw_topics: string[];
   raw_data?: string;
@@ -247,6 +249,14 @@ export interface ContractMeta {
   dependency_advisory?: DependencyAdvisory | null;
   /** Protocol type — auto-tagged from ABI functions or set explicitly. */
   protocol_type?: "token" | "dex" | "lending" | "nft" | "bridge" | "other";
+  lookalike_warning?: {
+    is_lookalike: boolean;
+    resembles: string;
+    authoritative_contract_id: string;
+    warning: string;
+    risk_level: "high" | "medium" | "low";
+    similarity_reason: string;
+  } | null;
 }
 
 export interface ContractStats {

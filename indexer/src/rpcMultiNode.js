@@ -15,6 +15,8 @@ import { rpc as SorobanRpc } from "@stellar/stellar-sdk";
 import config from "./config.js";
 import { verifyRpcRange } from "./rpcVerifier.js";
 import * as alertManager from "./alertManager.js";
+import { recordUpstreamLatency } from "./latencyDistribution.js";
+import { recordIncident } from "./incidentTimeline.js";
 
 const RPC_URLS = config.SOROBAN_RPC_URLS.length > 0 
   ? config.SOROBAN_RPC_URLS 
@@ -44,6 +46,11 @@ function recordOutcome(node, success, latencyMs) {
   if (node._outcomes.length > HEALTH_WINDOW) node._outcomes.shift();
   node._latencies.push(latencyMs);
   if (node._latencies.length > HEALTH_WINDOW) node._latencies.shift();
+  try {
+    recordUpstreamLatency(latencyMs);
+  } catch {
+    // Ignore non-request contexts
+  }
 }
 
 let primaryIndex = 0;
@@ -91,6 +98,13 @@ async function callWithFailover(method, ...args) {
       if (bestLedger - node.latestLedger > LAG_THRESHOLD) {
         logger.warn(`[rpc-multi] node ${node.url} is ${bestLedger - node.latestLedger} ledgers behind, switching`);
         node.healthy = false;
+        recordIncident({
+          event_type: "provider_change",
+          severity: "warning",
+          source: "rpc",
+          summary: `RPC node ${node.url} lagged ${bestLedger - node.latestLedger} ledgers behind consensus, switching`,
+          details: { url: node.url, bestLedger, nodeLedger: node.latestLedger },
+        }).catch(() => {});
         primaryIndex = nextHealthy(idx);
         idx = primaryIndex;
         continue;
@@ -99,6 +113,13 @@ async function callWithFailover(method, ...args) {
       // Promote to primary if we had to fail over
       if (idx !== primaryIndex) {
         logger.info(`[rpc-multi] promoting ${node.url} to primary`);
+        recordIncident({
+          event_type: "provider_change",
+          severity: "info",
+          source: "rpc",
+          summary: `Promoted ${node.url} to primary RPC node`,
+          details: { primaryUrl: node.url },
+        }).catch(() => {});
         primaryIndex = idx;
       }
 
@@ -107,6 +128,13 @@ async function callWithFailover(method, ...args) {
       recordOutcome(node, false, Date.now() - start);
       logger.warn(`[rpc-multi] node ${node.url} failed (${err.message}), trying next`);
       node.healthy = false;
+      recordIncident({
+        event_type: "provider_change",
+        severity: "warning",
+        source: "rpc",
+        summary: `RPC node ${node.url} call failed (${err.message}), switching provider`,
+        details: { url: node.url, error: err.message, method },
+      }).catch(() => {});
       idx = nextHealthy(idx);
     }
   }
@@ -133,6 +161,13 @@ async function checkNodeRecovery(node) {
     node.latestLedger = res.sequence;
     node.healthy = true;
     logger.info(`[rpc-multi] node ${node.url} recovered`);
+    recordIncident({
+      event_type: "recovery_action",
+      severity: "info",
+      source: "rpc",
+      summary: `RPC node recovered: ${node.url}`,
+      details: { url: node.url, latestLedger: res.sequence },
+    }).catch(() => {});
   } catch {
     recordOutcome(node, false, Date.now() - start);
     // still down

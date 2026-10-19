@@ -90,20 +90,169 @@ export function createClient(opts = {}) {
   const baseUrl = opts.baseUrl ?? "http://localhost:3001";
   const apiKey = opts.apiKey;
   const customFetch = opts.fetch ?? fetch;
+  const defaultTimeout = opts.timeout;
+  const defaultRetry = opts.retry;
 
-  /** @param {string} path @param {RequestInit} [init] */
+  /** @param {string} path @param {RequestInit & { timeout?: number, retry?: object|boolean, idempotent?: boolean }} [init] */
   async function request(path, init = {}) {
-    const headers = { ...init.headers };
-    if (apiKey) headers["x-api-key"] = apiKey;
-    if (!headers["Content-Type"] && init.method && init.method !== "GET") {
-      headers["Content-Type"] = "application/json";
-    }
+    const method = (init.method || "GET").toUpperCase();
+    const timeoutMs = init.timeout ?? defaultTimeout;
+    const effectiveRetry = init.retry !== undefined ? init.retry : defaultRetry;
 
-    const url = `${baseUrl.replace(/\/+$/, "")}/api${path}`;
-    const res = await customFetch(url, { ...init, headers });
+    const retryPolicy =
+      effectiveRetry === false
+        ? null
+        : typeof effectiveRetry === "object"
+          ? {
+              maxRetries: 3,
+              initialDelayMs: 500,
+              maxDelayMs: 10000,
+              backoffFactor: 2,
+              jitter: true,
+              retryableStatusCodes: [408, 429, 500, 502, 503, 504],
+              retryableMethods: ["GET", "HEAD", "OPTIONS"],
+              ...effectiveRetry,
+            }
+          : effectiveRetry === true
+            ? {
+                maxRetries: 3,
+                initialDelayMs: 500,
+                maxDelayMs: 10000,
+                backoffFactor: 2,
+                jitter: true,
+                retryableStatusCodes: [408, 429, 500, 502, 503, 504],
+                retryableMethods: ["GET", "HEAD", "OPTIONS"],
+              }
+            : null;
 
-    if (!res.ok) {
-      const body = await res.text();
+    const canRetryMethod =
+      Boolean(init.idempotent) ||
+      (retryPolicy?.retryableMethods ?? ["GET", "HEAD", "OPTIONS"]).includes(method);
+    const maxRetries = retryPolicy?.maxRetries ?? 0;
+
+    let attempt = 0;
+    while (true) {
+      attempt++;
+
+      if (init.signal?.aborted) {
+        throw init.signal.reason ?? new Error("Request aborted");
+      }
+
+      let timer = null;
+      let timeoutController;
+      if (timeoutMs && timeoutMs > 0) {
+        timeoutController = new AbortController();
+        timer = setTimeout(() => {
+          timeoutController?.abort(new Error(`Request timeout after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }
+
+      let compositeSignal = init.signal;
+      let cleanupSignals = () => {};
+      if (init.signal && timeoutController) {
+        if (typeof AbortSignal.any === "function") {
+          compositeSignal = AbortSignal.any([init.signal, timeoutController.signal]);
+        } else {
+          const comp = new AbortController();
+          const onAbort = () => comp.abort();
+          init.signal.addEventListener("abort", onAbort, { once: true });
+          timeoutController.signal.addEventListener("abort", onAbort, { once: true });
+          cleanupSignals = () => {
+            init.signal?.removeEventListener("abort", onAbort);
+            timeoutController?.signal.removeEventListener("abort", onAbort);
+          };
+          compositeSignal = comp.signal;
+        }
+      } else if (timeoutController) {
+        compositeSignal = timeoutController.signal;
+      }
+
+      const headers = { ...init.headers };
+      if (apiKey) headers["x-api-key"] = apiKey;
+      if (!headers["Content-Type"] && init.method && init.method !== "GET") {
+        headers["Content-Type"] = "application/json";
+      }
+
+      const url = `${baseUrl.replace(/\/+$/, "")}/api${path}`;
+      let res;
+      let networkError;
+
+      try {
+        res = await customFetch(url, { ...init, headers, signal: compositeSignal });
+      } catch (err) {
+        if (timer) clearTimeout(timer);
+        cleanupSignals();
+        if (init.signal?.aborted) throw init.signal.reason ?? err;
+        if (timeoutController?.signal.aborted) throw timeoutController.signal.reason;
+        networkError = err;
+      } finally {
+        if (timer) clearTimeout(timer);
+        cleanupSignals();
+      }
+
+      if (res && res.ok) {
+        const contentType = res.headers?.get?.("content-type") || "";
+        if (contentType.includes("application/json") || typeof res.json === "function") {
+          return typeof res.json === "function" ? res.json() : JSON.parse(await res.text());
+        }
+        return typeof res.text === "function" ? res.text() : String(res);
+      }
+
+      const status = res ? res.status : undefined;
+      const retryCodes = retryPolicy?.retryableStatusCodes ?? [408, 429, 500, 502, 503, 504];
+      const isStatusRetryable = status !== undefined && retryCodes.includes(status);
+      const isNetworkRetryable =
+        networkError !== undefined &&
+        !init.signal?.aborted &&
+        !timeoutController?.signal.aborted;
+
+      const shouldRetry =
+        retryPolicy !== null &&
+        canRetryMethod &&
+        attempt <= maxRetries &&
+        (isStatusRetryable || isNetworkRetryable);
+
+      if (shouldRetry) {
+        let delayMs =
+          (retryPolicy.initialDelayMs ?? 500) *
+          Math.pow(retryPolicy.backoffFactor ?? 2, attempt - 1);
+        const retryAfterHeader = res?.headers?.get?.("Retry-After");
+        if (retryAfterHeader) {
+          const parsed = Number(retryAfterHeader);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            delayMs = parsed * 1000;
+          }
+        }
+        delayMs = Math.min(delayMs, retryPolicy.maxDelayMs ?? 10000);
+        if (retryPolicy.jitter !== false) {
+          delayMs = delayMs * (1 + Math.random() * 0.25);
+        }
+
+        if (retryPolicy.onRetry) {
+          retryPolicy.onRetry({ attempt, delayMs, error: networkError, status });
+        }
+
+        await new Promise((resolve, reject) => {
+          if (init.signal?.aborted) return reject(init.signal.reason ?? new Error("Request aborted"));
+          const t = setTimeout(resolve, delayMs);
+          init.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(t);
+              reject(init.signal?.reason ?? new Error("Request aborted"));
+            },
+            { once: true },
+          );
+        });
+
+        continue;
+      }
+
+      if (networkError) {
+        throw networkError;
+      }
+
+      const body = typeof res.text === "function" ? await res.text() : String(res);
       let message;
       try {
         const parsed = JSON.parse(body);
@@ -113,18 +262,12 @@ export function createClient(opts = {}) {
       }
       throw new Error(message);
     }
-
-    const contentType = res.headers.get("content-type") || "";
-    if (contentType.includes("application/json")) {
-      return res.json();
-    }
-    return res.text();
   }
 
   return {
     /**
      * Fetch paginated events.
-     * @param {EventsParams} [params]
+     * @param {EventsParams & { signal?: AbortSignal, timeout?: number, retry?: object|boolean }} [params]
      * @returns {Promise<EventsPage>}
      */
     async events(params = {}) {
@@ -138,77 +281,88 @@ export function createClient(opts = {}) {
       if (params.after_seq) q.set("after_seq", String(params.after_seq));
       if (params.limit) q.set("limit", String(params.limit));
       if (params.count) q.set("count", params.count);
-      return request(`/events?${q}`);
+      return request(`/events?${q}`, {
+        signal: params.signal,
+        timeout: params.timeout,
+        retry: params.retry,
+      });
     },
 
     /**
      * Fetch a single event by sequence number.
      * @param {number} seq
+     * @param {{ signal?: AbortSignal, timeout?: number, retry?: object|boolean }} [opts]
      * @returns {Promise<DecodedEvent>}
      */
-    async event(seq) {
-      return request(`/events/${seq}`);
+    async event(seq, opts = {}) {
+      return request(`/events/${seq}`, opts);
     },
 
     /**
      * Search across contracts, events, and wallets.
      * @param {string} query
      * @param {number} [limit=10]
+     * @param {{ signal?: AbortSignal, timeout?: number, retry?: object|boolean }} [opts]
      * @returns {Promise<SearchResult>}
      */
-    async search(query, limit = 10) {
+    async search(query, limit = 10, opts = {}) {
       const q = new URLSearchParams();
       q.set("q", query);
       q.set("limit", String(limit));
-      return request(`/search?${q}`);
+      return request(`/search?${q}`, opts);
     },
 
     /**
      * Get contract metadata.
      * @param {string} id - Contract ID.
+     * @param {{ signal?: AbortSignal, timeout?: number, retry?: object|boolean }} [opts]
      * @returns {Promise<ContractMeta>}
      */
-    async contract(id) {
-      return request(`/contracts/${id}`);
+    async contract(id, opts = {}) {
+      return request(`/contracts/${id}`, opts);
     },
 
     /**
      * List registered contracts.
      * @param {number} [page=1]
      * @param {number} [limit=25]
+     * @param {{ signal?: AbortSignal, timeout?: number, retry?: object|boolean }} [opts]
      * @returns {Promise<ContractsListResponse>}
      */
-    async listContracts(page = 1, limit = 25) {
+    async listContracts(page = 1, limit = 25, opts = {}) {
       const q = new URLSearchParams();
       q.set("page", String(page));
       q.set("limit", String(limit));
-      return request(`/contracts?${q}`);
+      return request(`/contracts?${q}`, opts);
     },
 
     /**
      * Get events for a wallet address.
      * @param {string} address - Stellar public key (starts with G).
+     * @param {{ signal?: AbortSignal, timeout?: number, retry?: object|boolean }} [opts]
      * @returns {Promise<WalletResponse>}
      */
-    async wallet(address) {
-      return request(`/wallet/${address}`);
+    async wallet(address, opts = {}) {
+      return request(`/wallet/${address}`, opts);
     },
 
     /**
      * Get aggregate stats.
+     * @param {{ signal?: AbortSignal, timeout?: number, retry?: object|boolean }} [opts]
      * @returns {Promise<{events: number, contracts: number}>}
      */
-    async stats() {
-      return request("/stats");
+    async stats(opts = {}) {
+      return request("/stats", opts);
     },
 
     /**
      * Get contract ABI JSON.
      * @param {string} id
+     * @param {{ signal?: AbortSignal, timeout?: number, retry?: object|boolean }} [opts]
      * @returns {Promise<object>}
      */
-    async contractAbi(id) {
-      return request(`/contracts/${id}/abi`);
+    async contractAbi(id, opts = {}) {
+      return request(`/contracts/${id}/abi`, opts);
     },
   };
 }

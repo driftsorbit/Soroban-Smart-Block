@@ -33,7 +33,7 @@ export default function AbiUploadZone({ onLoad, onClear, localAbi, parseError }:
 
   // ── File reading ────────────────────────────────────────────────────────────
 
-  function readFile(file: File) {
+  const readFile = useCallback((file: File) => {
     setReadError(null);
 
     if (!file.name.endsWith(".json")) {
@@ -60,7 +60,7 @@ export default function AbiUploadZone({ onLoad, onClear, localAbi, parseError }:
     };
     reader.onerror = () => setReadError("File read failed.");
     reader.readAsText(file);
-  }
+  }, [onLoad]);
 
   // ── Drag handlers ───────────────────────────────────────────────────────────
 
@@ -81,7 +81,7 @@ export default function AbiUploadZone({ onLoad, onClear, localAbi, parseError }:
       const file = e.dataTransfer.files[0];
       if (file) readFile(file);
     },
-    [onLoad],
+    [readFile],
   );
 
   const onInputChange = useCallback(
@@ -91,7 +91,7 @@ export default function AbiUploadZone({ onLoad, onClear, localAbi, parseError }:
       // Reset so the same file can be re-uploaded
       e.target.value = "";
     },
-    [onLoad],
+    [readFile],
   );
 
   const error = readError ?? parseError;

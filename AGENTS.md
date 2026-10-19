@@ -103,7 +103,9 @@ cd contracts/ticket && cargo test --features testutils --release
 
 ### Indexer (required if you touched indexer/)
 ```bash
-cd indexer && npm test
+cd indexer && npm run test:unit          # offline, no external services
+cd indexer && npm run test:integration   # needs TEST_DATABASE_URL pointing at a reachable Postgres
+cd indexer && npm test                   # runs both
 ```
 
 ### Frontend (required if you touched frontend/)

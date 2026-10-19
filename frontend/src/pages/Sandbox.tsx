@@ -12,29 +12,30 @@ import {
   saveSandbox,
   LocalSandboxHost,
   SimulationResult,
+  ResourceBudget,
   parseArgs,
   simulateRemote,
-  replayScenario,
-  compareProtocols,
-  listCollections,
-  saveCollection,
-  exportCollection,
-  importCollection,
-  validateSimulationAuth,
-  AuthValidationResult,
-  ReplayResult,
-  ProtocolComparisonResult,
-  ScenarioCollection,
+  createCheckpoint,
 } from "../services/sandbox-api";
 import { createAutoSaver } from "../services/session";
 import { WebContainer } from "@webcontainer/api";
+import XdrInspectorTree from "../components/XdrInspectorTree";
+import SimulationBudgetDeltas from "../components/SimulationBudgetDeltas";
+import TestVectorsPanel from "../components/TestVectorsPanel";
+import CheckpointManager from "../components/CheckpointManager";
 
 const Editor = lazy(() => import("../components/Editor"));
 
-/** Contract simulation, auth validation, replay, protocol comparison, and scenario collections (#1090-#1093). */
-const SimulationPanel: React.FC = () => {
+interface SimulationPanelProps {
+  sandboxId?: string;
+  files?: Map<string, SandboxFile>;
+  onResetFiles?: (files: Map<string, SandboxFile>) => void;
+}
+
+/** Contract simulation via the RPC proxy or the in-browser Soroban host (#925, #1094, #1096, #1097, #1098). */
+const SimulationPanel: React.FC<SimulationPanelProps> = ({ sandboxId = "", files = new Map(), onResetFiles }) => {
   const hostRef = useRef<LocalSandboxHost | null>(null);
-  const [activeTab, setActiveTab] = useState<"simulate" | "replay" | "protocols" | "collections">("simulate");
+  const previousBudgetRef = useRef<ResourceBudget | null>(null);
   const [local, setLocal] = useState(false);
   const [contractId, setContractId] = useState("");
   const [fn, setFn] = useState("");
@@ -43,6 +44,8 @@ const SimulationPanel: React.FC = () => {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [result, setResult] = useState<SimulationResult | null>(null);
+  const [activeTab, setActiveTab] = useState<"simulate" | "vectors" | "xdr" | "checkpoints">("simulate");
+  const [customXdrInput, setCustomXdrInput] = useState("");
 
   // Auth Validation state (#1093)
   const [authValidation, setAuthValidation] = useState<AuthValidationResult | null>(null);
@@ -98,255 +101,131 @@ const SimulationPanel: React.FC = () => {
   const simulate = () =>
     withBusy(async () => {
       const a = parseArgs(args);
-      // Automatically validate auth requirements before simulation
-      try {
-        const authRes = await validateSimulationAuth(contractId, fn, a, [], sourceAccount || undefined);
-        setAuthValidation(authRes);
-      } catch {
-        // Fall back gracefully if auth validation endpoint is unavailable
-      }
-      setResult(local ? await (await host()).simulate(contractId, fn, a) : await simulateRemote(contractId, fn, a));
+      const res = local
+        ? await (await host()).simulate(contractId, fn, a, previousBudgetRef.current)
+        : await simulateRemote(contractId, fn, a, previousBudgetRef.current);
+      setResult(res);
+
+      // Save previous budget for next simulation delta comparison (#1096)
+      previousBudgetRef.current = {
+        cpuInsns: res.cpuInsns,
+        memBytes: res.memBytes,
+        ledgerIO: res.ledgerIO,
+        minResourceFee: res.minResourceFee,
+        ledgerIOUnavailable: res.ledgerIOUnavailable,
+        feeUnavailable: res.feeUnavailable,
+      };
     });
 
-  const handleReplay = () =>
-    withBusy(async () => {
-      const parsed = parseArgs(args);
-      const res = await replayScenario({
-        name: scenarioName || `${fn} on ${contractId.slice(0, 8)}...`,
-        contractId,
-        fn,
-        args: parsed,
-        env: {
-          sequence: Number(ledgerSeq) || 100000,
-          timestamp: Number(timestamp) || Math.floor(Date.now() / 1000),
-          protocolVersion: 20,
-        },
-        baselineResult: result
-          ? {
-              returnValue: result.returnValue,
-              error: result.error,
-              cost: { cpuInsns: result.cpuInsns, memBytes: result.memBytes },
-              events: result.events,
-            }
-          : undefined,
-      });
-      setReplayResult(res);
-      setStatus(
-        res.isLedgerDependent
-          ? `⚠ Replayed: Ledger-dependent results flagged (${res.ledgerDependencies.length} dependency)`
-          : `✓ Replayed: Deterministic result verified`,
-      );
-    });
-
-  const handleCompareProtocols = () =>
-    withBusy(async () => {
-      const parsed = parseArgs(args);
-      const res = await compareProtocols(contractId, fn, parsed, [20, 21, 22]);
-      setProtocolResult(res);
-      setStatus(`✓ Protocol comparison completed: ${res.comparisons.length} versions analyzed`);
-    });
-
-  const loadCollections = async () => {
-    try {
-      const data = await listCollections(50);
-      setCollections(data.collections);
-    } catch (e) {
-      console.warn("Could not load collections:", e);
-    }
-  };
-
-  useEffect(() => {
-    if (activeTab === "collections") {
-      loadCollections();
-    }
-  }, [activeTab]);
-
-  const handleSaveToCollection = () =>
-    withBusy(async () => {
-      if (!collectionName.trim()) {
-        setStatus("✗ Please provide a collection name");
-        return;
-      }
-      const parsed = parseArgs(args);
-      const res = await saveCollection({
-        name: collectionName.trim(),
-        scenarios: [
-          {
-            name: scenarioName || `${fn} scenario`,
-            contractId,
-            fn,
-            args: parsed,
-            env: {
-              sequence: Number(ledgerSeq) || 100000,
-              timestamp: Number(timestamp) || Math.floor(Date.now() / 1000),
-            },
-          },
-        ],
-      });
-      setStatus(`✓ Saved to collection '${res.collection.name}' (secrets stripped: ${res.strippedSecretsCount})`);
-      setCollectionName("");
-      loadCollections();
-    });
-
-  const handleExport = (colId: string) =>
-    withBusy(async () => {
-      const exported = await exportCollection(colId);
-      const blob = new Blob([JSON.stringify(exported, null, 2)], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `scenario-collection-${colId}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      setStatus(`✓ Exported collection safely without secrets (stripped: ${exported.strippedSecretsCount})`);
-    });
-
-  const handleImport = () =>
-    withBusy(async () => {
-      if (!importJson.trim()) {
-        setStatus("✗ Please paste JSON to import");
-        return;
-      }
-      const imported = await importCollection(importJson);
-      setStatus(
-        `✓ Imported collection '${imported.collection.name}' (secrets sanitized: ${imported.strippedSecretsCount})`,
-      );
-      setImportJson("");
-      loadCollections();
-    });
+  let parsedInputArgs: any[] | null = null;
+  let parseInputError: string | null = null;
+  try {
+    parsedInputArgs = parseArgs(args);
+  } catch (err: any) {
+    parseInputError = err.message;
+  }
 
   return (
     <div className="preview">
-      <div
-        className="preview-header"
-        style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}
-      >
-        <span>Contract Sandbox</span>
-      </div>
-      <div
-        style={{
-          display: "flex",
-          borderBottom: "1px solid var(--border)",
-          background: "var(--surface)",
-          fontSize: "11px",
-        }}
-      >
+      <div className="preview-header">Contract Simulation & Tools</div>
+      <div style={{ display: "flex", gap: "2px", borderBottom: "1px solid var(--border)", padding: "4px 8px", background: "var(--surface)" }}>
         <button
-          style={{
-            flex: 1,
-            padding: "6px",
-            background: activeTab === "simulate" ? "var(--bg)" : "transparent",
-            border: "none",
-            color: "inherit",
-            cursor: "pointer",
-            fontWeight: activeTab === "simulate" ? "bold" : "normal",
-          }}
           onClick={() => setActiveTab("simulate")}
+          style={{
+            background: activeTab === "simulate" ? "var(--accent)" : "transparent",
+            color: activeTab === "simulate" ? "var(--accent-contrast, #fff)" : "var(--text)",
+            border: "none",
+            borderRadius: "3px",
+            fontSize: "11px",
+            padding: "2px 8px",
+            cursor: "pointer",
+          }}
         >
           Simulate
         </button>
         <button
+          onClick={() => setActiveTab("vectors")}
           style={{
-            flex: 1,
-            padding: "6px",
-            background: activeTab === "replay" ? "var(--bg)" : "transparent",
+            background: activeTab === "vectors" ? "var(--accent)" : "transparent",
+            color: activeTab === "vectors" ? "var(--accent-contrast, #fff)" : "var(--text)",
             border: "none",
-            color: "inherit",
+            borderRadius: "3px",
+            fontSize: "11px",
+            padding: "2px 8px",
             cursor: "pointer",
-            fontWeight: activeTab === "replay" ? "bold" : "normal",
           }}
-          onClick={() => setActiveTab("replay")}
         >
-          Replay (#1090)
+          Test Vectors
         </button>
         <button
+          onClick={() => setActiveTab("xdr")}
           style={{
-            flex: 1,
-            padding: "6px",
-            background: activeTab === "protocols" ? "var(--bg)" : "transparent",
+            background: activeTab === "xdr" ? "var(--accent)" : "transparent",
+            color: activeTab === "xdr" ? "var(--accent-contrast, #fff)" : "var(--text)",
             border: "none",
-            color: "inherit",
+            borderRadius: "3px",
+            fontSize: "11px",
+            padding: "2px 8px",
             cursor: "pointer",
-            fontWeight: activeTab === "protocols" ? "bold" : "normal",
           }}
-          onClick={() => setActiveTab("protocols")}
         >
-          Protocols (#1091)
+          XDR Inspector
         </button>
         <button
+          onClick={() => setActiveTab("checkpoints")}
           style={{
-            flex: 1,
-            padding: "6px",
-            background: activeTab === "collections" ? "var(--bg)" : "transparent",
+            background: activeTab === "checkpoints" ? "var(--accent)" : "transparent",
+            color: activeTab === "checkpoints" ? "var(--accent-contrast, #fff)" : "var(--text)",
             border: "none",
-            color: "inherit",
+            borderRadius: "3px",
+            fontSize: "11px",
+            padding: "2px 8px",
             cursor: "pointer",
-            fontWeight: activeTab === "collections" ? "bold" : "normal",
           }}
-          onClick={() => setActiveTab("collections")}
         >
-          Collections (#1092)
+          Checkpoints
         </button>
       </div>
 
-      <div className="preview-content" style={{ fontSize: "12px", display: "grid", gap: "6px", padding: "8px" }}>
-        <input
-          placeholder="Contract ID (C…)"
-          value={contractId}
-          onChange={(e) => setContractId(e.target.value.trim())}
-        />
-        <input placeholder="Function" value={fn} onChange={(e) => setFn(e.target.value.trim())} />
-        <input
-          placeholder='Args (JSON array), e.g. ["G…", 100]'
-          value={args}
-          onChange={(e) => setArgs(e.target.value)}
-        />
-
+      <div className="preview-content" style={{ fontSize: "12px", display: "grid", gap: "6px" }}>
         {activeTab === "simulate" && (
           <>
-            <input
-              placeholder="Source Account (optional G…)"
-              value={sourceAccount}
-              onChange={(e) => setSourceAccount(e.target.value.trim())}
-            />
             <label>
-              <input type="checkbox" checked={local} onChange={(e) => setLocal(e.target.checked)} /> Local execution
-              (offline host)
+              <input type="checkbox" checked={local} onChange={(e) => setLocal(e.target.checked)} /> Local execution (offline, in-browser host)
             </label>
-            <div style={{ display: "flex", gap: "6px" }}>
+            <input placeholder="Contract ID (C…)" value={contractId} onChange={(e) => setContractId(e.target.value.trim())} />
+            <input placeholder="Function" value={fn} onChange={(e) => setFn(e.target.value.trim())} />
+            <input placeholder='Args (JSON array), e.g. ["G…", 100]' value={args} onChange={(e) => setArgs(e.target.value)} />
+            <div>
               {local && (
                 <button onClick={importState} disabled={busy || !contractId || !fn}>
                   Import state
                 </button>
-              )}
-              <button onClick={handleValidateAuth} disabled={busy || !contractId || !fn}>
-                Validate Auth (#1093)
-              </button>
-              <button onClick={simulate} disabled={busy || !contractId || !fn} style={{ fontWeight: "bold" }}>
+              )}{" "}
+              <button onClick={simulate} disabled={busy || !contractId || !fn}>
                 {busy ? "Working…" : "Simulate"}
               </button>
             </div>
+            {status && <div>{status}</div>}
 
-            {authValidation && (
-              <div
-                data-testid="auth-validation-result"
-                style={{
-                  background: authValidation.valid ? "rgba(46,160,67,0.15)" : "rgba(244,135,113,0.15)",
-                  padding: "6px",
-                  borderRadius: "4px",
-                }}
-              >
-                <div style={{ fontWeight: "bold", color: authValidation.valid ? "#2ea043" : "#f48771" }}>
-                  {authValidation.valid ? "✓ Auth Requirements Satisfied" : "⚠ Missing or Malformed Auth Requirements"}
-                </div>
-                <div style={{ fontSize: "11px", marginTop: "2px" }}>{authValidation.explanation}</div>
-                {authValidation.missing.length > 0 && (
-                  <div style={{ marginTop: "4px", fontSize: "11px", color: "#f48771" }}>
-                    Missing: {authValidation.missing.map((m) => `${m.signer} for ${m.scope}`).join(", ")}
-                  </div>
-                )}
-              </div>
-            )}
+            {/* Resource budget deltas (#1096) */}
+            <SimulationBudgetDeltas
+              currentBudget={
+                result
+                  ? {
+                      cpuInsns: result.cpuInsns,
+                      memBytes: result.memBytes,
+                      ledgerIO: result.ledgerIO,
+                      minResourceFee: result.minResourceFee,
+                      ledgerIOUnavailable: result.ledgerIOUnavailable,
+                      feeUnavailable: result.feeUnavailable,
+                    }
+                  : null
+              }
+              deltas={result?.budgetDeltas}
+              mode={result?.mode ?? (local ? "local" : "remote")}
+              error={result?.error}
+            />
 
             {result && (
               <div data-testid="simulation-result">
@@ -358,151 +237,96 @@ const SimulationPanel: React.FC = () => {
                 {result.error ? (
                   <div style={{ color: "#f48771" }}>✗ {result.error}</div>
                 ) : (
-                  <div>Return value (XDR): {result.returnValue}</div>
+                  <XdrInspectorTree title="Return Value (XDR Tree)" xdrBase64={result.returnValue} />
                 )}
-                <div>
-                  Budget ({result.mode}): {result.cpuInsns.toLocaleString()} CPU · {result.memBytes.toLocaleString()}{" "}
-                  bytes mem
-                </div>
-                <div>
-                  Events: {result.events.length} · State changes: {result.stateDiff.length}
-                </div>
+                {result.events && result.events.length > 0 && (
+                  <div style={{ marginTop: "4px" }}>
+                    <div style={{ fontWeight: 600, fontSize: "11px", color: "var(--muted)" }}>Events ({result.events.length}):</div>
+                    {result.events.map((ev, i) => (
+                      <XdrInspectorTree key={i} title={`Event #${i + 1}`} xdrBase64={ev} />
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </>
         )}
 
-        {activeTab === "replay" && (
-          <div style={{ display: "grid", gap: "6px" }}>
-            <input
-              placeholder="Scenario Name (optional)"
-              value={scenarioName}
-              onChange={(e) => setScenarioName(e.target.value)}
-            />
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px" }}>
-              <input placeholder="Ledger Seq" value={ledgerSeq} onChange={(e) => setLedgerSeq(e.target.value)} />
-              <input placeholder="Timestamp" value={timestamp} onChange={(e) => setTimestamp(e.target.value)} />
-            </div>
-            <button onClick={handleReplay} disabled={busy || !contractId || !fn}>
-              {busy ? "Replaying…" : "Replay Scenario (#1090)"}
-            </button>
-            {replayResult && (
-              <div
-                data-testid="replay-result"
-                style={{ background: "rgba(255,255,255,0.05)", padding: "6px", borderRadius: "4px" }}
-              >
-                <div>
-                  Deterministic: <strong>{replayResult.isDeterministic ? "Yes ✓" : "No ✗"}</strong>
-                </div>
-                <div style={{ color: replayResult.isLedgerDependent ? "#f48771" : "#2ea043" }}>
-                  Ledger Dependent: <strong>{replayResult.isLedgerDependent ? "Yes ⚠" : "No (Pure) ✓"}</strong>
-                </div>
-                {replayResult.warning && (
-                  <div style={{ color: "#e5c07b", fontSize: "11px" }}>{replayResult.warning}</div>
-                )}
-                {replayResult.ledgerDependencies.length > 0 && (
-                  <ul style={{ paddingLeft: "16px", margin: "4px 0", fontSize: "11px" }}>
-                    {replayResult.ledgerDependencies.map((d, i) => (
-                      <li key={i}>{d}</li>
-                    ))}
-                  </ul>
-                )}
-                <div style={{ fontSize: "11px" }}>
-                  CPU: {replayResult.replayResult.cost.cpuInsns.toLocaleString()} · Mem:{" "}
-                  {replayResult.replayResult.cost.memBytes.toLocaleString()} bytes
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        {activeTab === "protocols" && (
-          <div style={{ display: "grid", gap: "6px" }}>
-            <button onClick={handleCompareProtocols} disabled={busy || !contractId || !fn}>
-              {busy ? "Comparing…" : "Compare Protocols (20, 21, 22) (#1091)"}
-            </button>
-            {protocolResult && (
-              <div data-testid="protocol-comparison-result" style={{ fontSize: "11px" }}>
-                <div style={{ fontWeight: "bold", marginBottom: "4px" }}>{protocolResult.summary}</div>
-                {protocolResult.comparisons.map((c) => (
-                  <div
-                    key={c.protocol}
-                    style={{
-                      border: "1px solid var(--border)",
-                      padding: "4px",
-                      marginBottom: "4px",
-                      borderRadius: "4px",
-                    }}
-                  >
-                    <div style={{ fontWeight: "bold", color: "#61afef" }}>{c.label}</div>
-                    <div>
-                      Status: {c.environment.status} · Network: {c.environment.network}
-                    </div>
-                    <div>
-                      CPU: {c.cost.cpuInsns.toLocaleString()} · Memory: {c.cost.memBytes.toLocaleString()} bytes
-                    </div>
-                    <div>Est. Fee: {c.minResourceFee} stroops</div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {activeTab === "collections" && (
-          <div style={{ display: "grid", gap: "6px" }}>
-            <input
-              placeholder="New Collection Name"
-              value={collectionName}
-              onChange={(e) => setCollectionName(e.target.value)}
-            />
-            <button onClick={handleSaveToCollection} disabled={busy || !contractId || !fn || !collectionName.trim()}>
-              Save Current Scenario to Collection (#1092)
-            </button>
-            <div style={{ fontWeight: "bold", marginTop: "4px" }}>Saved Collections ({collections.length}):</div>
-            {collections.map((col) => (
-              <div
-                key={col.id}
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  borderBottom: "1px solid var(--border)",
-                  padding: "2px 0",
-                }}
-              >
-                <span>
-                  {col.name} ({col.scenarioCount})
-                </span>
-                <button style={{ fontSize: "10px", padding: "2px 6px" }} onClick={() => handleExport(col.id)}>
-                  Export
-                </button>
-              </div>
-            ))}
-            <div style={{ marginTop: "6px" }}>
-              <textarea
-                placeholder="Paste exported JSON collection to import..."
-                rows={2}
-                style={{ width: "100%", fontSize: "10px" }}
-                value={importJson}
-                onChange={(e) => setImportJson(e.target.value)}
-              />
-              <button onClick={handleImport} disabled={busy || !importJson.trim()}>
-                Import Collection (No Secrets)
-              </button>
-            </div>
-          </div>
-        )}
-
-        {status && (
-          <div
-            style={{
-              fontSize: "11px",
-              color: status.startsWith("✗") ? "#f48771" : status.startsWith("⚠") ? "#e5c07b" : "#98c379",
+        {activeTab === "vectors" && (
+          <TestVectorsPanel
+            onSelectVector={(newArgs) => {
+              setArgs(newArgs);
+              setActiveTab("simulate");
             }}
-          >
-            {status}
+          />
+        )}
+
+        {activeTab === "xdr" && (
+          <div>
+            <div style={{ marginBottom: "8px" }}>
+              <div style={{ fontWeight: 600, marginBottom: "4px" }}>Simulation Input XDR Inspector</div>
+              {parseInputError ? (
+                <div style={{ color: "#f48771", fontSize: "11px" }}>✗ Invalid JSON arguments: {parseInputError}</div>
+              ) : parsedInputArgs && parsedInputArgs.length > 0 ? (
+                <XdrInspectorTree title="Input Arguments (XDR Tree)" scValList={parsedInputArgs} />
+              ) : (
+                <div style={{ color: "var(--muted)", fontStyle: "italic", fontSize: "11px" }}>No input arguments provided.</div>
+              )}
+            </div>
+
+            <div style={{ marginBottom: "8px" }}>
+              <div style={{ fontWeight: 600, marginBottom: "4px" }}>Simulation Output XDR Inspector</div>
+              {result?.returnValue ? (
+                <XdrInspectorTree title="Return Value (XDR Tree)" xdrBase64={result.returnValue} />
+              ) : (
+                <div style={{ color: "var(--muted)", fontStyle: "italic", fontSize: "11px" }}>
+                  No return value yet. Run a simulation to inspect output.
+                </div>
+              )}
+            </div>
+
+            <div style={{ borderTop: "1px solid var(--border)", paddingTop: "8px" }}>
+              <div style={{ fontWeight: 600, marginBottom: "4px" }}>Inspect Custom XDR (with Raw Fallback)</div>
+              <textarea
+                placeholder="Paste raw Base64 XDR string to inspect tree..."
+                value={customXdrInput}
+                onChange={(e) => setCustomXdrInput(e.target.value)}
+                rows={2}
+                style={{
+                  width: "100%",
+                  fontFamily: "monospace",
+                  fontSize: "11px",
+                  padding: "4px",
+                  backgroundColor: "var(--bg)",
+                  color: "var(--text)",
+                  border: "1px solid var(--border)",
+                  borderRadius: "4px",
+                  boxSizing: "border-box",
+                  marginBottom: "4px",
+                }}
+              />
+              {customXdrInput && <XdrInspectorTree title="Custom XDR Payload" xdrBase64={customXdrInput} />}
+            </div>
           </div>
+        )}
+
+        {activeTab === "checkpoints" && (
+          <CheckpointManager
+            sandboxId={sandboxId}
+            files={files}
+            onFilesReset={(newFiles) => {
+              if (onResetFiles) onResetFiles(newFiles);
+            }}
+            currentContractId={contractId}
+            currentFn={fn}
+            currentArgs={args}
+            onLoadScenario={(sc) => {
+              setContractId(sc.contractId);
+              setFn(sc.fn);
+              setArgs(sc.args);
+              setActiveTab("simulate");
+            }}
+          />
         )}
       </div>
     </div>
@@ -544,6 +368,11 @@ const Sandbox: React.FC = () => {
       // Persist to backend
       await saveSandbox(sandboxId, templateId, templateMap);
 
+      // Create initial named checkpoint for non-destructive reset (#1098)
+      createCheckpoint(sandboxId, "Initial Template State", `Initialized template: ${template.name}`, templateMap).catch((e) => {
+        console.warn("Failed to create initial checkpoint:", e);
+      });
+
       setTerminalOutput(["> Sandbox initialized with " + template.name]);
       setShowTemplateSelector(false);
     } catch (error) {
@@ -570,6 +399,22 @@ const Sandbox: React.FC = () => {
       const newFiles = new Map(files).set(selectedFile, updatedFile);
       setFiles(newFiles);
     }
+  };
+
+  const handleResetFiles = async (newFiles: Map<string, SandboxFile>) => {
+    setFiles(newFiles);
+    if (webcontainerRef.current) {
+      try {
+        await mountFiles(webcontainerRef.current, newFiles);
+      } catch (err) {
+        console.warn("Failed to re-mount files in WebContainer:", err);
+      }
+    }
+    const firstKey = Array.from(newFiles.keys())[0];
+    if (firstKey) {
+      setSelectedFile(firstKey);
+    }
+    setTerminalOutput((prev) => [...prev, "> Environment restored from checkpoint."]);
   };
 
   // Auto-persist files when they change
@@ -636,7 +481,15 @@ const Sandbox: React.FC = () => {
         </button>
       </div>
 
-      <ActionBar files={files} sandboxId={sandboxId} />
+      <ActionBar
+        files={files}
+        sandboxId={sandboxId}
+        onSaveCheckpoint={() => {
+          createCheckpoint(sandboxId, `Checkpoint ${new Date().toLocaleTimeString()}`, "Manual checkpoint", files)
+            .then(() => setTerminalOutput((prev) => [...prev, "> Checkpoint saved."]))
+            .catch(() => {});
+        }}
+      />
 
       <div className="sandbox-layout">
         <FileExplorer files={Array.from(files.values())} selectedFile={selectedFile} onSelectFile={handleFileSelect} />
@@ -653,7 +506,7 @@ const Sandbox: React.FC = () => {
 
         <div className="right-panel">
           <Preview packageJsonContent={files.get("package.json")?.content || ""} />
-          <SimulationPanel />
+          <SimulationPanel sandboxId={sandboxId} files={files} onResetFiles={handleResetFiles} />
           <Terminal output={terminalOutput} />
         </div>
       </div>

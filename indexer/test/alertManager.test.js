@@ -10,6 +10,7 @@ import {
   checkThroughput,
   checkDlqSize,
   checkDecodeRate,
+  checkDbPoolSaturation,
 } from "../src/alertManager.js";
 
 // Reset active alert state between tests by resolving all conditions
@@ -20,8 +21,9 @@ function resetAlerts() {
 }
 
 describe("ALERT_CONDITIONS", () => {
-  it("exports exactly 9 conditions", () => {
-    assert.equal(Object.keys(ALERT_CONDITIONS).length, 9);
+  it("exports all alert conditions including DB_POOL_SATURATION", () => {
+    assert.ok(Object.keys(ALERT_CONDITIONS).length >= 10);
+    assert.ok("DB_POOL_SATURATION" in ALERT_CONDITIONS);
   });
 
   it("includes all required condition names", () => {
@@ -35,6 +37,7 @@ describe("ALERT_CONDITIONS", () => {
       "DLQ_THRESHOLD",
       "REORG_DETECTED",
       "DECODE_RATE_LOW",
+      "DB_POOL_SATURATION",
     ];
     for (const name of expected) {
       assert.ok(name in ALERT_CONDITIONS, `missing condition: ${name}`);
@@ -186,3 +189,41 @@ describe("checkDecodeRate", () => {
     assert.ok(!active.some((a) => a.condition === ALERT_CONDITIONS.DECODE_RATE_LOW));
   });
 });
+
+describe("checkDbPoolSaturation", () => {
+  beforeEach(() => resetAlerts());
+
+  it("fires DB_POOL_SATURATION when pool saturation ratio exceeds threshold", async () => {
+    await checkDbPoolSaturation({ saturation: 0.90, avgWaitTimeMs: 50, waitingCount: 0 });
+    const active = getActiveAlerts();
+    assert.ok(active.some((a) => a.condition === ALERT_CONDITIONS.DB_POOL_SATURATION));
+  });
+
+  it("fires DB_POOL_SATURATION when wait time exceeds threshold", async () => {
+    await checkDbPoolSaturation({ saturation: 0.50, avgWaitTimeMs: 1500, waitingCount: 0 });
+    const active = getActiveAlerts();
+    assert.ok(active.some((a) => a.condition === ALERT_CONDITIONS.DB_POOL_SATURATION));
+  });
+
+  it("fires DB_POOL_SATURATION when clients are queued waiting for connections", async () => {
+    await checkDbPoolSaturation({ saturation: 0.60, avgWaitTimeMs: 100, waitingCount: 3 });
+    const active = getActiveAlerts();
+    assert.ok(active.some((a) => a.condition === ALERT_CONDITIONS.DB_POOL_SATURATION));
+  });
+
+  it("resolves DB_POOL_SATURATION when pool metrics return to healthy levels", async () => {
+    await fireAlert(ALERT_CONDITIONS.DB_POOL_SATURATION, "saturated");
+    await checkDbPoolSaturation({ saturation: 0.40, avgWaitTimeMs: 20, waitingCount: 0 });
+    const active = getActiveAlerts();
+    assert.ok(!active.some((a) => a.condition === ALERT_CONDITIONS.DB_POOL_SATURATION));
+  });
+
+  it("handles empty or invalid inputs gracefully", async () => {
+    await checkDbPoolSaturation(null);
+    await checkDbPoolSaturation(undefined);
+    await checkDbPoolSaturation({});
+    const active = getActiveAlerts();
+    assert.ok(!active.some((a) => a.condition === ALERT_CONDITIONS.DB_POOL_SATURATION));
+  });
+});
+

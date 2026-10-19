@@ -35,6 +35,7 @@ import StorageTierStackedBar from "../components/StorageTierStackedBar";
 import OfflineContractActions from "../components/OfflineContractActions";
 import { CodeVerificationBadge, CodeVerificationPanel } from "../components/CodeVerification";
 import ContractReadWrite from "../components/contract/ContractReadWrite";
+import { safeText } from "../utils/safeRendering";
 
 type Tab = "overview" | "source" | "simulate" | "read-write" | "flow" | "roles" | "networks" | "graph" | "call-graph" | "state-diff" | "storage" | "abi-history";
 
@@ -285,6 +286,51 @@ export default function ContractPage() {
       {/* RWA metadata display */}
       <RwaMetadataDisplay contractId={id} />
 
+      {/* Phishing / Lookalike Security Warning (#1121) */}
+      {meta.lookalike_warning?.is_lookalike && (
+        <div
+          role="alert"
+          style={{
+            backgroundColor: "rgba(229, 72, 77, 0.12)",
+            border: "1px solid #e5484d",
+            borderRadius: 6,
+            padding: "12px 16px",
+            marginBottom: 16,
+            color: "var(--text)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+            <span style={{ fontSize: 18 }}>⚠️</span>
+            <strong style={{ color: "#e5484d" }}>
+              Phishing Risk: Lookalike Contract Name
+            </strong>
+            <span
+              className="badge"
+              style={{
+                backgroundColor: "#e5484d",
+                color: "#fff",
+                fontSize: 11,
+                textTransform: "uppercase",
+              }}
+            >
+              {meta.lookalike_warning.risk_level} risk
+            </span>
+          </div>
+          <p style={{ margin: "4px 0 8px 0", fontSize: 13 }}>
+            {meta.lookalike_warning.warning}
+          </p>
+          <div style={{ fontSize: 12, color: "var(--muted)" }}>
+            <strong>Authoritative Contract ID:</strong>{" "}
+            <code style={{ color: "var(--text)", wordBreak: "break-all" }}>
+              {meta.lookalike_warning.authoritative_contract_id}
+            </code>
+            <p style={{ margin: "4px 0 0 0" }}>
+              Contract names are untrusted metadata. On Stellar/Soroban, only the Contract ID is cryptographically verified and authoritative.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div className="card">
         <div
@@ -296,7 +342,7 @@ export default function ContractPage() {
         >
           <div>
             <div style={{ display: "flex", alignItems: "center", marginBottom: 8 }}>
-              <h2 id="contract-title" style={{ margin: 0 }}>{meta.name || "Unnamed Contract"}</h2>
+              <h2 id="contract-title" style={{ margin: 0 }}>{safeText(meta.name, "Unnamed Contract")}</h2>
               {(meta as any).is_verified && <VerifiedBadge ledger={(meta as any).verified_ledger} />}{' '}
               <SourceVerifiedBadge contractId={id} />
               <CodeVerificationBadge contractId={id} />
@@ -312,7 +358,7 @@ export default function ContractPage() {
               )}
             </div>
             <p style={{ color: "var(--muted)", marginBottom: 12 }}>
-              {meta.description || "No contract description available."}
+              {safeText(meta.description, "No contract description available.")}
             </p>
             <code
               style={{
